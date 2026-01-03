@@ -230,7 +230,20 @@ struct ReferenceOrbit {
     int escape_iter;                   // Iteration at escape, or -1 if bounded
     DD center_re, center_im;           // High-precision center for this orbit
 
-    ReferenceOrbit() : length(0), escape_iter(-1) {}
+    // ═══════════════════════════════════════════════════════════════════════
+    // SERIES APPROXIMATION (SA) COEFFICIENTS
+    // ═══════════════════════════════════════════════════════════════════════
+    // For pixel at C = C_ref + δC, the orbit deviation is:
+    //   δZ_n ≈ A_n * δC + B_n * δC² + C_n * δC³ + ...
+    // This allows skipping many iterations by evaluating the polynomial.
+    // Coefficients are complex, stored as real/imag pairs.
+    std::vector<double> SA_Ar, SA_Ai;  // A coefficient (linear term)
+    std::vector<double> SA_Br, SA_Bi;  // B coefficient (quadratic term)
+    std::vector<double> SA_Cr, SA_Ci;  // C coefficient (cubic term)
+    std::vector<double> SA_A_norm;     // |A_n|² for validity checks
+    bool sa_enabled = false;           // Whether SA was computed
+
+    ReferenceOrbit() : length(0), escape_iter(-1), sa_enabled(false) {}
 
     void clear() {
         Zr_hi.clear();
@@ -240,8 +253,13 @@ struct ReferenceOrbit {
         Zr_sum.clear();
         Zi_sum.clear();
         Z_norm.clear();
+        SA_Ar.clear(); SA_Ai.clear();
+        SA_Br.clear(); SA_Bi.clear();
+        SA_Cr.clear(); SA_Ci.clear();
+        SA_A_norm.clear();
         length = 0;
         escape_iter = -1;
+        sa_enabled = false;
     }
 };
 
@@ -260,6 +278,7 @@ constexpr int MAX_REFERENCES = 8;               // Allow multiple reference orbi
 constexpr double GLITCH_RATE_LIMIT = 0.15;      // Max glitch rate before DD fallback
 
 // Compute reference orbit at high precision, store with full DD precision
+// Also computes Series Approximation (SA) coefficients for iteration skipping
 inline void compute_reference_orbit(ReferenceOrbit& orbit,
                                     DD center_x, DD center_y,
                                     int max_iter) {
@@ -276,6 +295,15 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
     orbit.Zi_sum.reserve(max_iter + 1);
     orbit.Z_norm.reserve(max_iter + 1);
 
+    // Reserve space for SA coefficients
+    orbit.SA_Ar.reserve(max_iter + 1);
+    orbit.SA_Ai.reserve(max_iter + 1);
+    orbit.SA_Br.reserve(max_iter + 1);
+    orbit.SA_Bi.reserve(max_iter + 1);
+    orbit.SA_Cr.reserve(max_iter + 1);
+    orbit.SA_Ci.reserve(max_iter + 1);
+    orbit.SA_A_norm.reserve(max_iter + 1);
+
     // Initial Z = 0
     orbit.Zr_hi.push_back(0.0);
     orbit.Zr_lo.push_back(0.0);
@@ -285,8 +313,23 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
     orbit.Zi_sum.push_back(0.0);
     orbit.Z_norm.push_back(0.0);
 
+    // Initial SA coefficients: A_0 = B_0 = C_0 = 0 (since δZ_0 = 0)
+    orbit.SA_Ar.push_back(0.0);
+    orbit.SA_Ai.push_back(0.0);
+    orbit.SA_Br.push_back(0.0);
+    orbit.SA_Bi.push_back(0.0);
+    orbit.SA_Cr.push_back(0.0);
+    orbit.SA_Ci.push_back(0.0);
+    orbit.SA_A_norm.push_back(0.0);
+
     DDComplex C(center_x, center_y);
     DDComplex Z(0.0, 0.0);
+
+    // SA coefficients (complex numbers)
+    // δZ_n = A_n*δC + B_n*δC² + C_n*δC³
+    double Ar = 0.0, Ai = 0.0;  // A_n
+    double Br = 0.0, Bi = 0.0;  // B_n
+    double Cr = 0.0, Ci = 0.0;  // C_n
 
     for (int n = 0; n < max_iter; n++) {
         Z = Z.square() + C;
@@ -307,16 +350,178 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
         double norm = zr_sum * zr_sum + zi_sum * zi_sum;
         orbit.Z_norm.push_back(norm);
 
+        // ═══════════════════════════════════════════════════════════════════
+        // SA COEFFICIENT RECURRENCE
+        // ═══════════════════════════════════════════════════════════════════
+        // Given: δZ_{n+1} = 2*Z_n*δZ_n + δZ_n² + δC
+        // With: δZ_n = A_n*δC + B_n*δC² + C_n*δC³ + ...
+        //
+        // Recurrence relations (complex multiplication):
+        //   A_{n+1} = 2*Z_n*A_n + 1
+        //   B_{n+1} = 2*Z_n*B_n + A_n²
+        //   C_{n+1} = 2*Z_n*C_n + 2*A_n*B_n
+
+        // Use Z from previous iteration (Z_n before the square+C above)
+        // But we're computing coefficients for iteration n+1, so use Z_n
+        double Zr_prev = (n == 0) ? 0.0 : orbit.Zr_sum[n];
+        double Zi_prev = (n == 0) ? 0.0 : orbit.Zi_sum[n];
+
+        // A_{n+1} = 2*Z_n*A_n + 1
+        // Complex mul: (Zr + Zi*i) * (Ar + Ai*i) = (Zr*Ar - Zi*Ai) + (Zr*Ai + Zi*Ar)*i
+        double new_Ar = 2.0 * (Zr_prev * Ar - Zi_prev * Ai) + 1.0;
+        double new_Ai = 2.0 * (Zr_prev * Ai + Zi_prev * Ar);
+
+        // B_{n+1} = 2*Z_n*B_n + A_n²
+        // A² = (Ar + Ai*i)² = (Ar² - Ai²) + (2*Ar*Ai)*i
+        double A2r = Ar * Ar - Ai * Ai;
+        double A2i = 2.0 * Ar * Ai;
+        double new_Br = 2.0 * (Zr_prev * Br - Zi_prev * Bi) + A2r;
+        double new_Bi = 2.0 * (Zr_prev * Bi + Zi_prev * Br) + A2i;
+
+        // C_{n+1} = 2*Z_n*C_n + 2*A_n*B_n
+        // A*B = (Ar*Br - Ai*Bi) + (Ar*Bi + Ai*Br)*i
+        double ABr = Ar * Br - Ai * Bi;
+        double ABi = Ar * Bi + Ai * Br;
+        double new_Cr = 2.0 * (Zr_prev * Cr - Zi_prev * Ci) + 2.0 * ABr;
+        double new_Ci = 2.0 * (Zr_prev * Ci + Zi_prev * Cr) + 2.0 * ABi;
+
+        Ar = new_Ar; Ai = new_Ai;
+        Br = new_Br; Bi = new_Bi;
+        Cr = new_Cr; Ci = new_Ci;
+
+        // Store coefficients
+        orbit.SA_Ar.push_back(Ar);
+        orbit.SA_Ai.push_back(Ai);
+        orbit.SA_Br.push_back(Br);
+        orbit.SA_Bi.push_back(Bi);
+        orbit.SA_Cr.push_back(Cr);
+        orbit.SA_Ci.push_back(Ci);
+        orbit.SA_A_norm.push_back(Ar * Ar + Ai * Ai);
+
         // Use larger escape radius for reference (extends orbit length)
         if (norm > 1e6) {
             orbit.escape_iter = n + 1;
             orbit.length = n + 2;
+            orbit.sa_enabled = true;
             return;
         }
     }
 
     orbit.escape_iter = -1;  // Didn't escape
     orbit.length = max_iter + 1;
+    orbit.sa_enabled = true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SERIES APPROXIMATION (SA) EVALUATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// SA validity criterion: truncation error < tolerance * approximation value
+// We use 3 terms: δZ ≈ A*δC + B*δC² + C*δC³
+// Error is dominated by next term: ~D*δC⁴ ≈ O(|C|*|δC|*|δC³|) = O(|C|*|δC|⁴)
+// Approximation value is ~|A*δC| = |A|*|δC|
+// Criterion: |C|*|δC|⁴ < ε*|A|*|δC| => |C|*|δC|³ < ε*|A|
+// Squaring both sides for numerical convenience: |C|²*|δC|⁶ < ε²*|A|²
+// But we simplify to: |C|²*|δC|² < ε²*|A|² (conservative, works well in practice)
+constexpr double SA_TOLERANCE = 0.001;  // Conservative tolerance for accuracy
+
+// Find maximum iteration where SA approximation is valid for given δC
+// Returns the iteration to skip to, and computes the initial δz at that point
+inline int sa_find_skip_iteration(const ReferenceOrbit& orbit,
+                                   double dCr, double dCi,
+                                   double& dzr_out, double& dzi_out,
+                                   int max_iter) {
+    if (!orbit.sa_enabled || orbit.length < 2) {
+        dzr_out = 0.0;
+        dzi_out = 0.0;
+        return 0;
+    }
+
+    double dC_norm = dCr * dCr + dCi * dCi;
+    if (dC_norm == 0.0 || !std::isfinite(dC_norm)) {
+        dzr_out = 0.0;
+        dzi_out = 0.0;
+        return 0;
+    }
+
+    // Binary search for maximum valid skip iteration
+    int max_check = std::min(max_iter, orbit.length - 1);
+    int best_skip = 0;
+
+    // Use binary search to find the maximum valid skip
+    int lo = 1, hi = max_check;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+
+        // Get coefficient norms
+        double Cr = orbit.SA_Cr[mid];
+        double Ci = orbit.SA_Ci[mid];
+        double C_norm = Cr * Cr + Ci * Ci;
+        double A_norm = orbit.SA_A_norm[mid];
+
+        // Guard against overflow/NaN in coefficients
+        if (!std::isfinite(C_norm) || !std::isfinite(A_norm) || A_norm == 0.0) {
+            hi = mid - 1;
+            continue;
+        }
+
+        // Validity check: |C|² * |δC|² < ε² * |A|²
+        double lhs = C_norm * dC_norm;
+        double rhs = SA_TOLERANCE * SA_TOLERANCE * A_norm;
+
+        if (lhs < rhs) {
+            best_skip = mid;
+            lo = mid + 1;  // Try to find larger valid skip
+        } else {
+            hi = mid - 1;  // Current is invalid, search lower
+        }
+    }
+
+    // If we found a valid skip point, evaluate the SA polynomial
+    if (best_skip > 0) {
+        double Ar = orbit.SA_Ar[best_skip];
+        double Ai = orbit.SA_Ai[best_skip];
+        double Br = orbit.SA_Br[best_skip];
+        double Bi = orbit.SA_Bi[best_skip];
+        double Cr = orbit.SA_Cr[best_skip];
+        double Ci = orbit.SA_Ci[best_skip];
+
+        // Compute δC² = (dCr + i*dCi)²
+        double dC2r = dCr * dCr - dCi * dCi;
+        double dC2i = 2.0 * dCr * dCi;
+
+        // Compute δC³ = δC² * δC
+        double dC3r = dC2r * dCr - dC2i * dCi;
+        double dC3i = dC2r * dCi + dC2i * dCr;
+
+        // δZ = A*δC + B*δC² + C*δC³
+        // A*δC
+        double term1r = Ar * dCr - Ai * dCi;
+        double term1i = Ar * dCi + Ai * dCr;
+
+        // B*δC²
+        double term2r = Br * dC2r - Bi * dC2i;
+        double term2i = Br * dC2i + Bi * dC2r;
+
+        // C*δC³
+        double term3r = Cr * dC3r - Ci * dC3i;
+        double term3i = Cr * dC3i + Ci * dC3r;
+
+        dzr_out = term1r + term2r + term3r;
+        dzi_out = term1i + term2i + term3i;
+
+        // Guard against non-finite results from coefficient overflow
+        if (!std::isfinite(dzr_out) || !std::isfinite(dzi_out)) {
+            dzr_out = 0.0;
+            dzi_out = 0.0;
+            return 0;  // Fall back to no skip
+        }
+    } else {
+        dzr_out = 0.0;
+        dzi_out = 0.0;
+    }
+
+    return best_skip;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -781,14 +986,29 @@ void compute_perturbation_scalar(MandelbrotState& state,
             double dCr = total_x * cos_a - total_y * sin_a;
             double dCi = total_x * sin_a + total_y * cos_a;
 
-            // Perturbation iteration
+            // ═══════════════════════════════════════════════════════════════
+            // SERIES APPROXIMATION: Skip iterations using SA polynomial
+            // ═══════════════════════════════════════════════════════════════
             double dzr = 0.0, dzi = 0.0;
-            int iter = 0;
+            int iter = sa_find_skip_iteration(orbit, dCr, dCi, dzr, dzi, state.max_iter);
+
             bool escaped = false;
             bool glitched = false;
             double final_zr = 0, final_zi = 0;
 
-            while (iter < state.max_iter && iter < max_ref_iter) {
+            // Check if SA already found escape
+            if (iter > 0) {
+                double full_zr = orbit.Zr_sum[iter] + dzr;
+                double full_zi = orbit.Zi_sum[iter] + dzi;
+                double mag2 = full_zr * full_zr + full_zi * full_zi;
+                if (mag2 > 4.0) {
+                    escaped = true;
+                    final_zr = full_zr;
+                    final_zi = full_zi;
+                }
+            }
+
+            while (!escaped && iter < state.max_iter && iter < max_ref_iter) {
                 // Use precomputed sums for full DD precision
                 double Zr = orbit.Zr_sum[iter];
                 double Zi = orbit.Zi_sum[iter];
@@ -921,22 +1141,46 @@ void compute_perturbation_avx2(MandelbrotState& state,
             double dx3 = ((x + 3) - state.width / 2.0) / state.width * scale * aspect + pan_x;
 
             // δC = rotate(pixel_offset + pan_offset)
-            __m256d dC_r = _mm256_set_pd(
-                dx3 * cos_a - total_y * sin_a,
-                dx2 * cos_a - total_y * sin_a,
-                dx1 * cos_a - total_y * sin_a,
-                dx0 * cos_a - total_y * sin_a
-            );
-            __m256d dC_i = _mm256_set_pd(
-                dx3 * sin_a + total_y * cos_a,
-                dx2 * sin_a + total_y * cos_a,
-                dx1 * sin_a + total_y * cos_a,
-                dx0 * sin_a + total_y * cos_a
-            );
+            double dCr0 = dx0 * cos_a - total_y * sin_a;
+            double dCi0 = dx0 * sin_a + total_y * cos_a;
+            double dCr1 = dx1 * cos_a - total_y * sin_a;
+            double dCi1 = dx1 * sin_a + total_y * cos_a;
+            double dCr2 = dx2 * cos_a - total_y * sin_a;
+            double dCi2 = dx2 * sin_a + total_y * cos_a;
+            double dCr3 = dx3 * cos_a - total_y * sin_a;
+            double dCi3 = dx3 * sin_a + total_y * cos_a;
 
-            __m256d dzr = _mm256_setzero_pd();
-            __m256d dzi = _mm256_setzero_pd();
-            __m256d iter = _mm256_setzero_pd();
+            __m256d dC_r = _mm256_set_pd(dCr3, dCr2, dCr1, dCr0);
+            __m256d dC_i = _mm256_set_pd(dCi3, dCi2, dCi1, dCi0);
+
+            // ═══════════════════════════════════════════════════════════════
+            // SERIES APPROXIMATION: Skip iterations using SA polynomial
+            // ═══════════════════════════════════════════════════════════════
+            double dzr_arr[4] = {0, 0, 0, 0};
+            double dzi_arr[4] = {0, 0, 0, 0};
+            int skip0 = sa_find_skip_iteration(orbit, dCr0, dCi0, dzr_arr[0], dzi_arr[0], state.max_iter);
+            int skip1 = sa_find_skip_iteration(orbit, dCr1, dCi1, dzr_arr[1], dzi_arr[1], state.max_iter);
+            int skip2 = sa_find_skip_iteration(orbit, dCr2, dCi2, dzr_arr[2], dzi_arr[2], state.max_iter);
+            int skip3 = sa_find_skip_iteration(orbit, dCr3, dCi3, dzr_arr[3], dzi_arr[3], state.max_iter);
+
+            // Use minimum skip (all pixels must be valid at this iteration)
+            int min_skip = std::min({skip0, skip1, skip2, skip3});
+
+            // Re-evaluate SA at min_skip for all pixels to ensure consistency
+            if (min_skip > 0) {
+                sa_find_skip_iteration(orbit, dCr0, dCi0, dzr_arr[0], dzi_arr[0], min_skip);
+                sa_find_skip_iteration(orbit, dCr1, dCi1, dzr_arr[1], dzi_arr[1], min_skip);
+                sa_find_skip_iteration(orbit, dCr2, dCi2, dzr_arr[2], dzi_arr[2], min_skip);
+                sa_find_skip_iteration(orbit, dCr3, dCi3, dzr_arr[3], dzi_arr[3], min_skip);
+            } else {
+                // When min_skip == 0, explicitly zero all arrays (sa_find_skip returns 0 but may set values)
+                dzr_arr[0] = dzr_arr[1] = dzr_arr[2] = dzr_arr[3] = 0.0;
+                dzi_arr[0] = dzi_arr[1] = dzi_arr[2] = dzi_arr[3] = 0.0;
+            }
+
+            __m256d dzr = _mm256_set_pd(dzr_arr[3], dzr_arr[2], dzr_arr[1], dzr_arr[0]);
+            __m256d dzi = _mm256_set_pd(dzi_arr[3], dzi_arr[2], dzi_arr[1], dzi_arr[0]);
+            __m256d iter = _mm256_set1_pd((double)min_skip);
             __m256d active = _mm256_castsi256_pd(_mm256_set1_epi64x(-1));  // All true
 
             // For smooth coloring
@@ -945,9 +1189,24 @@ void compute_perturbation_avx2(MandelbrotState& state,
             __m256d has_escaped = _mm256_setzero_pd();
             __m256d is_glitched = _mm256_setzero_pd();
 
+            // Check for early escape after SA skip (matches scalar path behavior)
+            if (min_skip > 0) {
+                __m256d Zr_skip = _mm256_set1_pd(orbit.Zr_sum[min_skip]);
+                __m256d Zi_skip = _mm256_set1_pd(orbit.Zi_sum[min_skip]);
+                __m256d full_zr = _mm256_add_pd(Zr_skip, dzr);
+                __m256d full_zi = _mm256_add_pd(Zi_skip, dzi);
+                __m256d mag2 = _mm256_add_pd(_mm256_mul_pd(full_zr, full_zr),
+                                             _mm256_mul_pd(full_zi, full_zi));
+                __m256d early_escape = _mm256_cmp_pd(mag2, four, _CMP_GT_OQ);
+                has_escaped = _mm256_or_pd(has_escaped, early_escape);
+                escaped_zr = _mm256_blendv_pd(escaped_zr, full_zr, early_escape);
+                escaped_zi = _mm256_blendv_pd(escaped_zi, full_zi, early_escape);
+                active = _mm256_andnot_pd(early_escape, active);
+            }
+
             int max_n = std::min(state.max_iter, max_ref_iter);
 
-            for (int n = 0; n < max_n; n++) {
+            for (int n = min_skip; n < max_n; n++) {
                 // Broadcast reference values (using precomputed sums for precision)
                 __m256d Zr = _mm256_set1_pd(orbit.Zr_sum[n]);
                 __m256d Zi = _mm256_set1_pd(orbit.Zi_sum[n]);
