@@ -2128,70 +2128,19 @@ TrajectoryWaypoint CinematicPath::evaluate(double t) const {
     return {x, y, zoom, angle, score};
 }
 
-// Plan a cinematic path from start to target
+// Plan a cinematic path - simple zoom/rotate at target position
+// This creates a smooth zoom-in animation without jittery position changes
 CinematicPath plan_cinematic_path(double start_x, double start_y, double start_zoom, double start_angle,
                                    double target_x, double target_y, double target_zoom, double target_angle,
-                                   double duration, std::mt19937& rng) {
+                                   double duration, std::mt19937& /*rng*/) {
     CinematicPath path;
     path.total_duration = duration;
 
-    // Number of waypoints scales with zoom range
-    double zoom_range = log(target_zoom) - log(start_zoom);
-    int num_waypoints = std::max(10, std::min(30, (int)(zoom_range / log(10.0) * 2)));
-
-    // Generate logarithmically-spaced zoom levels
-    std::vector<double> zoom_levels;
-    for (int i = 0; i <= num_waypoints; i++) {
-        double t = (double)i / num_waypoints;
-        double log_zoom = log(start_zoom) + t * (log(target_zoom) - log(start_zoom));
-        zoom_levels.push_back(exp(log_zoom));
-    }
-
-    // Find best waypoint at each zoom level
-    double prev_x = start_x, prev_y = start_y;
-
-    for (int i = 0; i <= num_waypoints; i++) {
-        double zoom = zoom_levels[i];
-        double t = (double)i / num_waypoints;
-
-        // Expected position (linear interpolation toward target)
-        double expected_x = start_x + t * (target_x - start_x);
-        double expected_y = start_y + t * (target_y - start_y);
-
-        // Search radius shrinks as we approach target
-        // FIX: Search radius scales with zoom to find boundary
-        double viewport_width = 3.0 / zoom;
-        double base_radius;
-        if (zoom < 20.0) {
-            base_radius = 2.0;  // Large for escaping set interior
-        } else if (zoom < 1000.0) {
-            base_radius = std::max(0.1, 1.0 / sqrt(zoom));  // Medium zoom
-        } else {
-            base_radius = viewport_width * 50.0;  // Deep zoom: viewport-relative
-        }
-        double progress_factor = 1.0 - t * t;    // Quadratic convergence
-        double search_radius = base_radius * (0.2 + 0.8 * progress_factor);
-
-        TrajectoryWaypoint waypoint;
-
-        if (i == 0) {
-            // First waypoint is always start
-            waypoint = {start_x, start_y, start_zoom, start_angle, 100.0};
-        } else if (i == num_waypoints) {
-            // Last waypoint is always exact target
-            waypoint = {target_x, target_y, target_zoom, target_angle, 100.0};
-        } else {
-            // Find most interesting waypoint
-            waypoint = find_best_waypoint(expected_x, expected_y, zoom,
-                                          search_radius, prev_x, prev_y, rng);
-            // Interpolate angle linearly
-            waypoint.angle = start_angle + t * (target_angle - start_angle);
-        }
-
-        path.waypoints.push_back(waypoint);
-        prev_x = waypoint.x;
-        prev_y = waypoint.y;
-    }
+    // Simple approach: stay at target position, only interpolate zoom and angle
+    // This avoids the jittery waypoint-hopping of complex path planning
+    // Just two waypoints: start zoom/angle and end zoom/angle, both at target position
+    path.waypoints.push_back({target_x, target_y, start_zoom, start_angle, 100.0});
+    path.waypoints.push_back({target_x, target_y, target_zoom, target_angle, 100.0});
 
     path.valid = true;
     return path;
