@@ -2109,28 +2109,13 @@ TrajectoryWaypoint CinematicPath::evaluate(double t) const {
     double log_zoom = catmull_rom(log(p0.zoom), log(p1.zoom), log(p2.zoom), log(p3.zoom), local_t);
     double zoom = exp(log_zoom);
 
-    // FIX: Check if spline overshoots into boring region
-    // If so, fall back to linear interpolation between waypoints
-    double score = calculate_interest_score_at_zoom(x, y, zoom);
-    if (score < 0) {
-        // Spline overshot - try linear interpolation instead
-        double lin_x = p1.x + local_t * (p2.x - p1.x);
-        double lin_y = p1.y + local_t * (p2.y - p1.y);
-        double lin_score = calculate_interest_score_at_zoom(lin_x, lin_y, zoom);
-
-        // FIX: Re-score linear fallback - use whichever is less boring
-        if (lin_score >= score) {
-            x = lin_x;
-            y = lin_y;
-        }
-        // If both are boring, stay with spline (already assigned to x,y)
-        // The waypoints need to be closer together to fix this properly
-    }
-
     // Linear interpolation for angle (simpler, avoids wrap-around issues)
     double angle = p1.angle + local_t * (p2.angle - p1.angle);
 
-    return {x, y, zoom, angle, score};
+    // Note: We removed the per-frame interest score check here.
+    // With simplified paths (fixed position, zoom-only), there's no position
+    // overshoot possible. The expensive score calculation was a performance bug.
+    return {x, y, zoom, angle, 100.0};
 }
 
 // Plan a cinematic path - simple zoom/rotate at target position
