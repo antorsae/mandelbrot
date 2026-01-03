@@ -1744,6 +1744,11 @@ struct AutoExplorer {
     double traj_target_zoom = 1.0;
     double traj_target_angle = 0.0;
 
+    // DD precision targets for deep zoom (set from --pos DD format)
+    DD traj_target_x_dd{-0.5};
+    DD traj_target_y_dd{0.0};
+    bool has_dd_target = false;  // True if DD targets were explicitly set
+
     // Cached log values for zoom interpolation (computed once at trajectory start)
     double log_start_zoom = 0.0;
     double log_target_zoom = 0.0;
@@ -2195,11 +2200,18 @@ void update_auto_exploration(MandelbrotState& state, AutoExplorer& explorer) {
 
         // Check if trajectory is complete
         if (elapsed >= explorer.trajectory_duration) {
-            // Snap to exact target
+            // Snap to exact target with full DD precision if available
             state.center_x = explorer.traj_target_x;
             state.center_y = explorer.traj_target_y;
-            state.center_x_dd = DD(explorer.traj_target_x);
-            state.center_y_dd = DD(explorer.traj_target_y);
+            if (explorer.has_dd_target) {
+                // Use full DD precision from --pos
+                state.center_x_dd = explorer.traj_target_x_dd;
+                state.center_y_dd = explorer.traj_target_y_dd;
+                state.dd_authoritative = true;
+            } else {
+                state.center_x_dd = DD(explorer.traj_target_x);
+                state.center_y_dd = DD(explorer.traj_target_y);
+            }
             state.zoom = explorer.traj_target_zoom;
             state.angle = explorer.traj_target_angle;
 
@@ -2436,6 +2448,8 @@ int main(int argc, char* argv[]) {
     bool has_target_pos = false;
     bool has_target_zoom = false;
     double cli_target_x = -0.5, cli_target_y = 0.0;
+    DD cli_target_x_dd{-0.5}, cli_target_y_dd{0.0};  // DD precision for deep zoom
+    bool cli_has_dd_pos = false;  // True if --pos used DD format
     double cli_target_zoom = 1.0;
     double cli_target_angle = 0.0;
 
@@ -2464,9 +2478,12 @@ int main(int argc, char* argv[]) {
                     // Mark DD as authoritative if .lo components are non-zero
                     // (i.e., DD format was used, not regular double format)
                     state.dd_authoritative = (re_dd.lo != 0.0 || im_dd.lo != 0.0);
-                    // Set trajectory targets
+                    // Set trajectory targets (both double and DD)
                     cli_target_x = state.center_x;
                     cli_target_y = state.center_y;
+                    cli_target_x_dd = re_dd;
+                    cli_target_y_dd = im_dd;
+                    cli_has_dd_pos = state.dd_authoritative;
                     has_target_pos = true;
                 } else {
                     fprintf(stderr, "Error: Invalid position format '%s'\n", optarg);
@@ -2534,9 +2551,12 @@ int main(int argc, char* argv[]) {
         // Trajectory mode: animate from default start to specified target
         explorer.trajectory_mode = true;
 
-        // Store target values
+        // Store target values (both double and DD for precision)
         explorer.traj_target_x = cli_target_x;
         explorer.traj_target_y = cli_target_y;
+        explorer.traj_target_x_dd = cli_target_x_dd;
+        explorer.traj_target_y_dd = cli_target_y_dd;
+        explorer.has_dd_target = cli_has_dd_pos;
         explorer.traj_target_zoom = cli_target_zoom;
         explorer.traj_target_angle = cli_target_angle;
 
