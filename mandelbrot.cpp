@@ -1710,6 +1710,9 @@ void handle_input(MandelbrotState& state) {
 // AUTO EXPLORATION MODE
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Forward declaration for cinematic path
+struct CinematicPath;
+
 struct AutoExplorer {
     bool enabled = false;
     double target_zoom = 1e14;           // How deep to zoom
@@ -1740,8 +1743,40 @@ struct AutoExplorer {
     double log_start_zoom = 0.0;
     double log_target_zoom = 0.0;
 
+    // Cinematic path for interesting trajectories
+    std::unique_ptr<CinematicPath> cinematic_path;
+
     AutoExplorer() : rng(std::random_device{}()) {}
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CINEMATIC TRAJECTORY PLANNING
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct TrajectoryWaypoint {
+    double x, y;           // Position in complex plane
+    double zoom;           // Zoom level
+    double angle;          // View rotation
+    double interest_score; // For debugging/visualization
+};
+
+struct CinematicPath {
+    std::vector<TrajectoryWaypoint> waypoints;
+    double total_duration;
+    bool valid = false;
+
+    // Catmull-Rom spline evaluation at time t
+    TrajectoryWaypoint evaluate(double t) const;
+};
+
+// Forward declarations
+double calculate_interest_score_at_zoom(double cx, double cy, double zoom, int sample_radius = 5);
+TrajectoryWaypoint find_best_waypoint(double center_x, double center_y, double zoom,
+                                       double search_radius, double prev_x, double prev_y,
+                                       std::mt19937& rng);
+CinematicPath plan_cinematic_path(double start_x, double start_y, double start_zoom, double start_angle,
+                                   double target_x, double target_y, double target_zoom, double target_angle,
+                                   double duration, std::mt19937& rng);
 
 // Quick iteration count for a single point
 inline int quick_iterate(double cx, double cy, int max_iter) {
@@ -1905,10 +1940,207 @@ std::pair<double, double> find_interesting_point(AutoExplorer& explorer) {
     return {std::get<0>(candidates[pick]), std::get<1>(candidates[pick])};
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CINEMATIC PATH IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate interest score at a specific zoom level
+// The sample scale adapts to the zoom level for proper scale-aware scoring
+double calculate_interest_score_at_zoom(double cx, double cy, double zoom, int sample_radius) {
+    const int max_iter = 256;
+    // Sample scale adapts to zoom: at zoom 1, sample 0.01 apart; at zoom 1e6, sample 1e-8 apart
+    const double sample_scale = 2.0 / (zoom * 100.0);
+
+    std::vector<int> iterations;
+    int bounded_count = 0;
+    int escaped_count = 0;
+
+    for (int dy = -sample_radius; dy <= sample_radius; dy++) {
+        for (int dx = -sample_radius; dx <= sample_radius; dx++) {
+            double px = cx + dx * sample_scale;
+            double py = cy + dy * sample_scale;
+            int iter = quick_iterate(px, py, max_iter);
+            iterations.push_back(iter);
+            if (iter >= max_iter) bounded_count++;
+            else escaped_count++;
+        }
+    }
+
+    // Score based on boundary proximity and complexity
+    double on_boundary_score = 0;
+    if (bounded_count > 0 && escaped_count > 0) {
+        double ratio = std::min(bounded_count, escaped_count) /
+                       (double)std::max(bounded_count, escaped_count);
+        on_boundary_score = ratio * 50.0;
+    }
+
+    // Calculate variance for complexity
+    double sum = 0, sum_sq = 0;
+    for (int iter : iterations) {
+        sum += iter;
+        sum_sq += iter * iter;
+    }
+    double n = iterations.size();
+    double mean = sum / n;
+    double variance = std::max(0.0, (sum_sq / n) - (mean * mean));
+    double variance_score = std::min(50.0, sqrt(variance));
+
+    // Bonus for high average iteration
+    double avg_score = std::min(20.0, mean / 12.0);
+
+    return on_boundary_score + variance_score + avg_score;
+}
+
+// Find the best waypoint in a search region (EXPLORATORY mode)
+TrajectoryWaypoint find_best_waypoint(double center_x, double center_y, double zoom,
+                                       double search_radius, double prev_x, double prev_y,
+                                       std::mt19937& rng) {
+    const int NUM_CANDIDATES = 100;  // More candidates for thorough exploration
+    std::vector<TrajectoryWaypoint> candidates;
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+    // EXPLORATORY: Double the search radius for scenic options
+    double effective_radius = search_radius * 2.0;
+
+    for (int i = 0; i < NUM_CANDIDATES; i++) {
+        double dx = dist(rng) * effective_radius;
+        double dy = dist(rng) * effective_radius;
+        double cx = center_x + dx;
+        double cy = center_y + dy;
+
+        double score = calculate_interest_score_at_zoom(cx, cy, zoom);
+
+        // Light continuity penalty (prefer interesting over smooth)
+        double jump_dist = hypot(cx - prev_x, cy - prev_y);
+        double continuity_penalty = jump_dist * zoom * 0.02;
+        score -= continuity_penalty;
+
+        candidates.push_back({cx, cy, zoom, 0.0, score});
+    }
+
+    // Return best candidate
+    auto best = std::max_element(candidates.begin(), candidates.end(),
+        [](const auto& a, const auto& b) { return a.interest_score < b.interest_score; });
+
+    return *best;
+}
+
+// Catmull-Rom spline interpolation helper
+inline double catmull_rom(double p0, double p1, double p2, double p3, double t) {
+    double t2 = t * t;
+    double t3 = t2 * t;
+    return 0.5 * ((2.0 * p1) +
+                  (-p0 + p2) * t +
+                  (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+                  (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+}
+
 // Smooth easing function (ease-in-out cubic)
 inline double ease_in_out(double t) {
     return t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2;
 }
+
+// Evaluate cinematic path at time t using Catmull-Rom splines
+TrajectoryWaypoint CinematicPath::evaluate(double t) const {
+    if (!valid || waypoints.size() < 2) {
+        return waypoints.empty() ? TrajectoryWaypoint{0, 0, 1, 0, 0} : waypoints[0];
+    }
+
+    // Normalize time to [0, 1] and apply easing
+    double normalized = std::max(0.0, std::min(1.0, t / total_duration));
+    double eased = ease_in_out(normalized);
+
+    int n = waypoints.size() - 1;
+    double segment_pos = eased * n;
+    int segment = std::min((int)segment_pos, n - 1);
+    double local_t = segment_pos - segment;
+
+    // Get control points for Catmull-Rom (clamp at boundaries)
+    int i0 = std::max(0, segment - 1);
+    int i1 = segment;
+    int i2 = std::min(segment + 1, n);
+    int i3 = std::min(segment + 2, n);
+
+    const auto& p0 = waypoints[i0];
+    const auto& p1 = waypoints[i1];
+    const auto& p2 = waypoints[i2];
+    const auto& p3 = waypoints[i3];
+
+    // Interpolate each component
+    double x = catmull_rom(p0.x, p1.x, p2.x, p3.x, local_t);
+    double y = catmull_rom(p0.y, p1.y, p2.y, p3.y, local_t);
+
+    // Interpolate zoom in log space for natural feel
+    double log_zoom = catmull_rom(log(p0.zoom), log(p1.zoom), log(p2.zoom), log(p3.zoom), local_t);
+    double zoom = exp(log_zoom);
+
+    // Linear interpolation for angle (simpler, avoids wrap-around issues)
+    double angle = p1.angle + local_t * (p2.angle - p1.angle);
+
+    return {x, y, zoom, angle, 0};
+}
+
+// Plan a cinematic path from start to target
+CinematicPath plan_cinematic_path(double start_x, double start_y, double start_zoom, double start_angle,
+                                   double target_x, double target_y, double target_zoom, double target_angle,
+                                   double duration, std::mt19937& rng) {
+    CinematicPath path;
+    path.total_duration = duration;
+
+    // Number of waypoints scales with zoom range
+    double zoom_range = log(target_zoom) - log(start_zoom);
+    int num_waypoints = std::max(10, std::min(30, (int)(zoom_range / log(10.0) * 2)));
+
+    // Generate logarithmically-spaced zoom levels
+    std::vector<double> zoom_levels;
+    for (int i = 0; i <= num_waypoints; i++) {
+        double t = (double)i / num_waypoints;
+        double log_zoom = log(start_zoom) + t * (log(target_zoom) - log(start_zoom));
+        zoom_levels.push_back(exp(log_zoom));
+    }
+
+    // Find best waypoint at each zoom level
+    double prev_x = start_x, prev_y = start_y;
+
+    for (int i = 0; i <= num_waypoints; i++) {
+        double zoom = zoom_levels[i];
+        double t = (double)i / num_waypoints;
+
+        // Expected position (linear interpolation toward target)
+        double expected_x = start_x + t * (target_x - start_x);
+        double expected_y = start_y + t * (target_y - start_y);
+
+        // Search radius shrinks as we approach target
+        // At start: allow wide exploration; at end: converge to target
+        double base_radius = 0.5 / sqrt(zoom);  // Scale-appropriate radius
+        double progress_factor = 1.0 - t * t;    // Quadratic convergence
+        double search_radius = base_radius * (0.1 + 0.9 * progress_factor);
+
+        TrajectoryWaypoint waypoint;
+
+        if (i == 0) {
+            // First waypoint is always start
+            waypoint = {start_x, start_y, start_zoom, start_angle, 100.0};
+        } else if (i == num_waypoints) {
+            // Last waypoint is always exact target
+            waypoint = {target_x, target_y, target_zoom, target_angle, 100.0};
+        } else {
+            // Find most interesting waypoint
+            waypoint = find_best_waypoint(expected_x, expected_y, zoom,
+                                          search_radius, prev_x, prev_y, rng);
+            // Interpolate angle linearly
+            waypoint.angle = start_angle + t * (target_angle - start_angle);
+        }
+
+        path.waypoints.push_back(waypoint);
+        prev_x = waypoint.x;
+        prev_y = waypoint.y;
+    }
+
+    path.valid = true;
+    return path;
+}
+
 
 // Update auto exploration state
 void update_auto_exploration(MandelbrotState& state, AutoExplorer& explorer) {
@@ -1916,51 +2148,60 @@ void update_auto_exploration(MandelbrotState& state, AutoExplorer& explorer) {
 
     // Trajectory mode: interpolate from start to target over duration
     if (explorer.trajectory_mode) {
-        // Start the timer on first call
+        // Plan the cinematic path on first call
         if (!explorer.trajectory_started) {
+            // Plan the path through interesting waypoints
+            explorer.cinematic_path = std::make_unique<CinematicPath>(
+                plan_cinematic_path(
+                    explorer.start_x, explorer.start_y, explorer.start_zoom, explorer.start_angle,
+                    explorer.traj_target_x, explorer.traj_target_y,
+                    explorer.traj_target_zoom, explorer.traj_target_angle,
+                    explorer.trajectory_duration, explorer.rng
+                )
+            );
             explorer.trajectory_start = std::chrono::steady_clock::now();
             explorer.trajectory_started = true;
         }
 
-        // Calculate elapsed time (use steady_clock for monotonic timing)
+        // Calculate elapsed time
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - explorer.trajectory_start).count();
-        // Clamp t to [0, 1] to handle any timing anomalies
-        double t = std::max(0.0, std::min(1.0, elapsed / explorer.trajectory_duration));
 
-        // Apply easing for smooth animation
-        double eased_t = ease_in_out(t);
+        // Evaluate the cinematic path at current time
+        TrajectoryWaypoint wp = explorer.cinematic_path->evaluate(elapsed);
 
-        // Interpolate position linearly
-        double x = explorer.start_x + eased_t * (explorer.traj_target_x - explorer.start_x);
-        double y = explorer.start_y + eased_t * (explorer.traj_target_y - explorer.start_y);
+        // Update state from waypoint
+        state.center_x = wp.x;
+        state.center_y = wp.y;
+        state.center_x_dd = DD(wp.x);
+        state.center_y_dd = DD(wp.y);
+        state.zoom = wp.zoom;
+        state.angle = wp.angle;
 
-        // Interpolate zoom logarithmically using cached log values
-        double log_zoom = explorer.log_start_zoom + eased_t * (explorer.log_target_zoom - explorer.log_start_zoom);
-        double zoom = exp(log_zoom);
-
-        // Interpolate angle linearly
-        double angle = explorer.start_angle + eased_t * (explorer.traj_target_angle - explorer.start_angle);
-
-        // Update state
-        state.center_x = x;
-        state.center_y = y;
-        state.center_x_dd = DD(x);
-        state.center_y_dd = DD(y);
-        state.zoom = zoom;
-        state.angle = angle;
+        // Clear pan offset to match cinematic path
+        state.pan_offset_x = DD(0.0);
+        state.pan_offset_y = DD(0.0);
 
         // Increase iterations as we zoom deeper
-        int suggested_iter = 256 + (int)(log10(std::max(1.0, zoom)) * 50);
+        int suggested_iter = 256 + (int)(log10(std::max(1.0, wp.zoom)) * 50);
         state.max_iter = std::min(2048, std::max(256, suggested_iter));
 
         state.needs_redraw = true;
 
         // Check if trajectory is complete
-        if (t >= 1.0) {
-            // Trajectory finished - disable auto mode (stay at target)
+        if (elapsed >= explorer.trajectory_duration) {
+            // Snap to exact target
+            state.center_x = explorer.traj_target_x;
+            state.center_y = explorer.traj_target_y;
+            state.center_x_dd = DD(explorer.traj_target_x);
+            state.center_y_dd = DD(explorer.traj_target_y);
+            state.zoom = explorer.traj_target_zoom;
+            state.angle = explorer.traj_target_angle;
+
+            // Trajectory finished - disable auto mode
             explorer.enabled = false;
             explorer.trajectory_mode = false;
+            explorer.cinematic_path.reset();
         }
         return;
     }
