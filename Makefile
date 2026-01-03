@@ -1,15 +1,18 @@
 # Mandelbrot Explorer Makefile
 # Builds with maximum optimizations
 
-CXX = clang++
+CXX ?= clang++
 # Default: portable build without AVX2 (works on all x86_64 CPUs)
-CXXFLAGS = -std=c++17 -O3 -flto -ffast-math
+CXXFLAGS = -std=c++17 -O3 -flto -fno-fast-math
 LDFLAGS = -pthread
 
 TARGET = mandelbrot
 SRC = mandelbrot.cpp
 
-.PHONY: all clean run avx2 native
+TEST_TARGET = test_perturbation
+TEST_SRC = test_perturbation.cpp
+
+.PHONY: all clean run avx2 native test
 
 all: $(TARGET)
 
@@ -50,3 +53,10 @@ avx2: $(TARGET)
 native: CXXFLAGS += -march=native
 native: $(TARGET)
 	@echo "Built with native CPU optimizations"
+
+# Test build and run
+$(TEST_TARGET): $(TEST_SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
+
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)

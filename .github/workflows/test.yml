@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        compiler: [g++, clang++]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential
+
+    - name: Build mandelbrot
+      run: make CXX=${{ matrix.compiler }}
+
+    - name: Build tests
+      run: make test_perturbation CXX=${{ matrix.compiler }}
+
+    - name: Run perturbation tests
+      run: ./test_perturbation
+      timeout-minutes: 5
+
+  build-avx2:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build with AVX2
+      run: make avx2
+
+    - name: Build tests with AVX2
+      run: make test_perturbation CXXFLAGS="-std=c++17 -O3 -flto -fno-fast-math -mavx2"
+
+    - name: Run AVX2 perturbation tests
+      run: ./test_perturbation
+      timeout-minutes: 5

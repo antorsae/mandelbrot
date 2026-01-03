@@ -1,0 +1,91 @@
+name: Generate Demo GIF
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'mandelbrot.cpp'
+      - '.github/workflows/demo.yml'
+  workflow_dispatch:
+
+jobs:
+  generate-gif:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential ffmpeg
+
+    - name: Install VHS
+      run: |
+        # Install VHS for terminal recording
+        curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.7.1/vhs_0.7.1_Linux_x86_64.tar.gz | tar xz
+        sudo mv vhs /usr/local/bin/
+        # Install ttyd (required by VHS)
+        sudo apt-get install -y ttyd
+
+    - name: Build mandelbrot
+      run: make
+
+    - name: Create VHS tape file
+      run: |
+        cat > demo.tape << 'TAPE'
+        # VHS tape for Mandelbrot demo
+        Output assets/mandelbrot.gif
+        Set FontSize 14
+        Set Width 800
+        Set Height 500
+        Set Framerate 30
+
+        # Run mandelbrot with trajectory animation (15 seconds)
+        # The --auto 15 ensures it exits after 15 seconds
+        Type "./mandelbrot --pos -0.7115114743-0.3078112463i --zoom 1.86e+11 --auto 15"
+        Enter
+
+        # Wait for animation to complete (add buffer for startup)
+        Sleep 17s
+
+        # Send quit command in case trajectory didn't exit cleanly
+        Type "q"
+        Sleep 1s
+        TAPE
+
+    - name: Generate GIF
+      run: |
+        mkdir -p assets
+        # Run VHS with timeout to prevent infinite loops
+        timeout 120 vhs demo.tape || true
+        # Verify GIF was created
+        if [ ! -f assets/mandelbrot.gif ]; then
+          echo "GIF generation failed, creating placeholder"
+          # Create a simple placeholder message
+          echo "GIF generation failed in CI" > assets/mandelbrot.txt
+          exit 1
+        fi
+        ls -la assets/
+      timeout-minutes: 5
+
+    - name: Optimize GIF
+      run: |
+        if [ -f assets/mandelbrot.gif ]; then
+          # Optimize GIF size with ffmpeg
+          ffmpeg -i assets/mandelbrot.gif -vf "fps=15,scale=640:-1:flags=lanczos" -y assets/mandelbrot_opt.gif || true
+          if [ -f assets/mandelbrot_opt.gif ]; then
+            mv assets/mandelbrot_opt.gif assets/mandelbrot.gif
+          fi
+          ls -la assets/
+        fi
+
+    - name: Commit and push GIF
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add assets/mandelbrot.gif
+        git diff --staged --quiet || git commit -m "Update demo GIF"
+        git push
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
