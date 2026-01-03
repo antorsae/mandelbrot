@@ -1947,9 +1947,13 @@ std::pair<double, double> find_interesting_point(AutoExplorer& explorer) {
 // Calculate interest score at a specific zoom level
 // The sample scale adapts to the zoom level for proper scale-aware scoring
 double calculate_interest_score_at_zoom(double cx, double cy, double zoom, int sample_radius) {
-    const int max_iter = 256;
-    // Sample scale adapts to zoom: at zoom 1, sample 0.01 apart; at zoom 1e6, sample 1e-8 apart
-    const double sample_scale = 2.0 / (zoom * 100.0);
+    // FIX: Scale max_iter with zoom - deep zooms need more iterations
+    // At zoom 1: 256, at zoom 1e6: 512, at zoom 1e12: 768
+    const int max_iter = 256 + (int)(log10(std::max(1.0, zoom)) * 50);
+    // FIX: Sample scale covers full viewport (3/zoom wide)
+    // With sample_radius=5, we have 11 samples spanning viewport width
+    const double viewport_width = 3.0 / zoom;
+    const double sample_scale = viewport_width / (2.0 * sample_radius);
 
     std::vector<int> iterations;
     int bounded_count = 0;
@@ -1966,13 +1970,18 @@ double calculate_interest_score_at_zoom(double cx, double cy, double zoom, int s
         }
     }
 
-    // Score based on boundary proximity and complexity
-    double on_boundary_score = 0;
-    if (bounded_count > 0 && escaped_count > 0) {
-        double ratio = std::min(bounded_count, escaped_count) /
-                       (double)std::max(bounded_count, escaped_count);
-        on_boundary_score = ratio * 50.0;
+    // FIX: Strong penalty for uniform regions (all black or all escaped)
+    // Single-color regions are BORING - never select them
+    int total_samples = (int)iterations.size();
+    if (bounded_count == total_samples || escaped_count == total_samples) {
+        return -100.0;  // Strong negative score for uniform regions
     }
+
+    // Score based on boundary proximity - ratio of minority to majority type
+    // Higher ratio = closer to boundary = more interesting
+    double ratio = std::min(bounded_count, escaped_count) /
+                   (double)std::max(bounded_count, escaped_count);
+    double on_boundary_score = ratio * 50.0;
 
     // Calculate variance for complexity
     double sum = 0, sum_sq = 0;
@@ -1985,7 +1994,7 @@ double calculate_interest_score_at_zoom(double cx, double cy, double zoom, int s
     double variance = std::max(0.0, (sum_sq / n) - (mean * mean));
     double variance_score = std::min(50.0, sqrt(variance));
 
-    // Bonus for high average iteration
+    // Bonus for high average iteration (but NOT for uniform max_iter regions)
     double avg_score = std::min(20.0, mean / 12.0);
 
     return on_boundary_score + variance_score + avg_score;
@@ -1996,33 +2005,49 @@ TrajectoryWaypoint find_best_waypoint(double center_x, double center_y, double z
                                        double search_radius, double prev_x, double prev_y,
                                        std::mt19937& rng) {
     const int NUM_CANDIDATES = 100;  // More candidates for thorough exploration
-    std::vector<TrajectoryWaypoint> candidates;
     std::uniform_real_distribution<double> dist(-1.0, 1.0);
 
     // EXPLORATORY: Double the search radius for scenic options
     double effective_radius = search_radius * 2.0;
+    int search_attempts = 0;
+    const int MAX_SEARCH_ATTEMPTS = 3;  // Expand up to 3x if needed
 
-    for (int i = 0; i < NUM_CANDIDATES; i++) {
-        double dx = dist(rng) * effective_radius;
-        double dy = dist(rng) * effective_radius;
-        double cx = center_x + dx;
-        double cy = center_y + dy;
+    while (search_attempts < MAX_SEARCH_ATTEMPTS) {
+        std::vector<TrajectoryWaypoint> candidates;
 
-        double score = calculate_interest_score_at_zoom(cx, cy, zoom);
+        for (int i = 0; i < NUM_CANDIDATES; i++) {
+            double dx = dist(rng) * effective_radius;
+            double dy = dist(rng) * effective_radius;
+            double cx = center_x + dx;
+            double cy = center_y + dy;
 
-        // Light continuity penalty (prefer interesting over smooth)
-        double jump_dist = hypot(cx - prev_x, cy - prev_y);
-        double continuity_penalty = jump_dist * zoom * 0.02;
-        score -= continuity_penalty;
+            double score = calculate_interest_score_at_zoom(cx, cy, zoom);
 
-        candidates.push_back({cx, cy, zoom, 0.0, score});
+            // FIX: Scale-invariant continuity penalty (relative to search radius)
+            double jump_dist = hypot(cx - prev_x, cy - prev_y);
+            double jump_relative = jump_dist / effective_radius;
+            double continuity_penalty = std::min(20.0, jump_relative * 3.0);
+            score -= continuity_penalty;
+
+            candidates.push_back({cx, cy, zoom, 0.0, score});
+        }
+
+        // Find best candidate
+        auto best = std::max_element(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.interest_score < b.interest_score; });
+
+        // FIX: If best score is too low (likely in boring region), expand search
+        if (best->interest_score >= 5.0 || search_attempts == MAX_SEARCH_ATTEMPTS - 1) {
+            return *best;
+        }
+
+        // Expand search radius and try again
+        effective_radius *= 3.0;
+        search_attempts++;
     }
 
-    // Return best candidate
-    auto best = std::max_element(candidates.begin(), candidates.end(),
-        [](const auto& a, const auto& b) { return a.interest_score < b.interest_score; });
-
-    return *best;
+    // Should never reach here, but return something safe
+    return {center_x, center_y, zoom, 0.0, 0.0};
 }
 
 // Catmull-Rom spline interpolation helper
@@ -2066,7 +2091,7 @@ TrajectoryWaypoint CinematicPath::evaluate(double t) const {
     const auto& p2 = waypoints[i2];
     const auto& p3 = waypoints[i3];
 
-    // Interpolate each component
+    // Interpolate each component using Catmull-Rom spline
     double x = catmull_rom(p0.x, p1.x, p2.x, p3.x, local_t);
     double y = catmull_rom(p0.y, p1.y, p2.y, p3.y, local_t);
 
@@ -2074,10 +2099,28 @@ TrajectoryWaypoint CinematicPath::evaluate(double t) const {
     double log_zoom = catmull_rom(log(p0.zoom), log(p1.zoom), log(p2.zoom), log(p3.zoom), local_t);
     double zoom = exp(log_zoom);
 
+    // FIX: Check if spline overshoots into boring region
+    // If so, fall back to linear interpolation between waypoints
+    double score = calculate_interest_score_at_zoom(x, y, zoom);
+    if (score < 0) {
+        // Spline overshot - try linear interpolation instead
+        double lin_x = p1.x + local_t * (p2.x - p1.x);
+        double lin_y = p1.y + local_t * (p2.y - p1.y);
+        double lin_score = calculate_interest_score_at_zoom(lin_x, lin_y, zoom);
+
+        // FIX: Re-score linear fallback - use whichever is less boring
+        if (lin_score >= score) {
+            x = lin_x;
+            y = lin_y;
+        }
+        // If both are boring, stay with spline (already assigned to x,y)
+        // The waypoints need to be closer together to fix this properly
+    }
+
     // Linear interpolation for angle (simpler, avoids wrap-around issues)
     double angle = p1.angle + local_t * (p2.angle - p1.angle);
 
-    return {x, y, zoom, angle, 0};
+    return {x, y, zoom, angle, score};
 }
 
 // Plan a cinematic path from start to target
@@ -2111,10 +2154,18 @@ CinematicPath plan_cinematic_path(double start_x, double start_y, double start_z
         double expected_y = start_y + t * (target_y - start_y);
 
         // Search radius shrinks as we approach target
-        // At start: allow wide exploration; at end: converge to target
-        double base_radius = 0.5 / sqrt(zoom);  // Scale-appropriate radius
+        // FIX: Search radius scales with zoom to find boundary
+        double viewport_width = 3.0 / zoom;
+        double base_radius;
+        if (zoom < 20.0) {
+            base_radius = 2.0;  // Large for escaping set interior
+        } else if (zoom < 1000.0) {
+            base_radius = std::max(0.1, 1.0 / sqrt(zoom));  // Medium zoom
+        } else {
+            base_radius = viewport_width * 50.0;  // Deep zoom: viewport-relative
+        }
         double progress_factor = 1.0 - t * t;    // Quadratic convergence
-        double search_radius = base_radius * (0.1 + 0.9 * progress_factor);
+        double search_radius = base_radius * (0.2 + 0.8 * progress_factor);
 
         TrajectoryWaypoint waypoint;
 

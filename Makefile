@@ -12,7 +12,10 @@ SRC = mandelbrot.cpp
 TEST_TARGET = test_perturbation
 TEST_SRC = test_perturbation.cpp
 
-.PHONY: all clean run avx2 native test
+TEST_TRAJ_TARGET = test_trajectory
+TEST_TRAJ_SRC = test_trajectory.cpp
+
+.PHONY: all clean run avx2 native test test-trajectory test-all
 
 all: $(TARGET)
 
@@ -38,7 +41,7 @@ run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -f $(TARGET) $(TEST_TARGET)
+	rm -f $(TARGET) $(TEST_TARGET) $(TEST_TRAJ_TARGET)
 
 # Debug build
 debug: CXXFLAGS = -std=c++17 -g -fsanitize=address
@@ -60,3 +63,13 @@ $(TEST_TARGET): $(TEST_SRC)
 
 test: $(TEST_TARGET)
 	./$(TEST_TARGET)
+
+# Trajectory test build and run
+$(TEST_TRAJ_TARGET): $(TEST_TRAJ_SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
+
+test-trajectory: $(TEST_TRAJ_TARGET)
+	./$(TEST_TRAJ_TARGET)
+
+# Run all tests
+test-all: test test-trajectory

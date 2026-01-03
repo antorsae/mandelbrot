@@ -23,11 +23,18 @@ jobs:
     - name: Build mandelbrot
       run: make CXX=${{ matrix.compiler }}
 
-    - name: Build tests
+    - name: Build perturbation tests
       run: make test_perturbation CXX=${{ matrix.compiler }}
 
     - name: Run perturbation tests
       run: ./test_perturbation
+      timeout-minutes: 5
+
+    - name: Build trajectory tests
+      run: make test_trajectory CXX=${{ matrix.compiler }}
+
+    - name: Run trajectory tests (location only)
+      run: ./test_trajectory --skip-trajectory
       timeout-minutes: 5
 
   build-avx2:
@@ -39,9 +46,16 @@ jobs:
     - name: Build with AVX2
       run: make avx2
 
-    - name: Build tests with AVX2
+    - name: Build perturbation tests with AVX2
       run: make test_perturbation CXXFLAGS="-std=c++17 -O3 -flto -fno-fast-math -mavx2"
 
     - name: Run AVX2 perturbation tests
       run: ./test_perturbation
+      timeout-minutes: 5
+
+    - name: Build trajectory tests with AVX2
+      run: make test_trajectory CXXFLAGS="-std=c++17 -O3 -flto -fno-fast-math -mavx2"
+
+    - name: Run AVX2 trajectory tests (location only)
+      run: ./test_trajectory --skip-trajectory
       timeout-minutes: 5
