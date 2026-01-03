@@ -54,14 +54,13 @@ jobs:
         Set Height 500
         Set Framerate 30
 
-        # Run mandelbrot with trajectory animation (15 seconds)
-        # Use moderate zoom (1e8) for smooth real-time rendering on CI runners
-        # Higher zoom (1e11+) is too slow - perturbation theory takes seconds per frame
-        Type "./mandelbrot --pos -0.7453+0.1127i --zoom 1e8 --auto=15"
+        # Run mandelbrot with trajectory animation (20 seconds)
+        # Deep zoom to DD precision position
+        Type "./mandelbrot --pos -0.99999990959780061:5.4666149278543518e-18-0.29019415957242539:-1.502698260044518e-17i --zoom 9.641024524371531e+12 --auto=20"
         Enter
 
-        # Wait for animation to complete (add buffer for startup)
-        Sleep 17s
+        # Wait for animation to complete (add buffer for startup/rendering)
+        Sleep 25s
 
         # Send quit command in case trajectory didn't exit cleanly
         Type "q"
@@ -76,7 +75,7 @@ jobs:
         # Run VHS with timeout to prevent infinite loops
         # Capture exit code: 124 = timeout, others = VHS error
         set +e
-        timeout 120 vhs demo.tape
+        timeout 180 vhs demo.tape
         VHS_EXIT=$?
         set -e
         if [ $VHS_EXIT -eq 124 ]; then
