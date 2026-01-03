@@ -13,10 +13,10 @@
  *   Q/ESC               - Quit
  *
  * CLI Arguments:
- *   --pos <re+imi>      - Starting position (e.g., -0.5+0.0i)
- *   --zoom <value>      - Starting zoom level
- *   --angle <degrees>   - Starting view angle
- *   --auto              - Automatic exploration mode
+ *   --pos <re+imi>      - Target position (e.g., -0.5+0.0i)
+ *   --zoom <value>      - Target zoom level
+ *   --angle <degrees>   - Target view angle
+ *   --auto [N]          - Auto mode, or trajectory to --pos/--zoom over N sec
  */
 
 #include <cstdio>
@@ -1718,6 +1718,28 @@ struct AutoExplorer {
     double current_rotation_dir = 1.0;   // 1 or -1
     std::mt19937 rng;
 
+    // Trajectory mode: animate from start to target over duration seconds
+    bool trajectory_mode = false;
+    double trajectory_duration = 30.0;   // Duration in seconds (default 30)
+    std::chrono::steady_clock::time_point trajectory_start;  // Use steady_clock for monotonic timing
+    bool trajectory_started = false;
+
+    // Start point (defaults)
+    double start_x = -0.5;
+    double start_y = 0.0;
+    double start_zoom = 1.0;
+    double start_angle = 0.0;
+
+    // Target point (from CLI)
+    double traj_target_x = -0.5;
+    double traj_target_y = 0.0;
+    double traj_target_zoom = 1.0;
+    double traj_target_angle = 0.0;
+
+    // Cached log values for zoom interpolation (computed once at trajectory start)
+    double log_start_zoom = 0.0;
+    double log_target_zoom = 0.0;
+
     AutoExplorer() : rng(std::random_device{}()) {}
 };
 
@@ -1883,10 +1905,67 @@ std::pair<double, double> find_interesting_point(AutoExplorer& explorer) {
     return {std::get<0>(candidates[pick]), std::get<1>(candidates[pick])};
 }
 
+// Smooth easing function (ease-in-out cubic)
+inline double ease_in_out(double t) {
+    return t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2;
+}
+
 // Update auto exploration state
 void update_auto_exploration(MandelbrotState& state, AutoExplorer& explorer) {
     if (!explorer.enabled) return;
 
+    // Trajectory mode: interpolate from start to target over duration
+    if (explorer.trajectory_mode) {
+        // Start the timer on first call
+        if (!explorer.trajectory_started) {
+            explorer.trajectory_start = std::chrono::steady_clock::now();
+            explorer.trajectory_started = true;
+        }
+
+        // Calculate elapsed time (use steady_clock for monotonic timing)
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - explorer.trajectory_start).count();
+        // Clamp t to [0, 1] to handle any timing anomalies
+        double t = std::max(0.0, std::min(1.0, elapsed / explorer.trajectory_duration));
+
+        // Apply easing for smooth animation
+        double eased_t = ease_in_out(t);
+
+        // Interpolate position linearly
+        double x = explorer.start_x + eased_t * (explorer.traj_target_x - explorer.start_x);
+        double y = explorer.start_y + eased_t * (explorer.traj_target_y - explorer.start_y);
+
+        // Interpolate zoom logarithmically using cached log values
+        double log_zoom = explorer.log_start_zoom + eased_t * (explorer.log_target_zoom - explorer.log_start_zoom);
+        double zoom = exp(log_zoom);
+
+        // Interpolate angle linearly
+        double angle = explorer.start_angle + eased_t * (explorer.traj_target_angle - explorer.start_angle);
+
+        // Update state
+        state.center_x = x;
+        state.center_y = y;
+        state.center_x_dd = DD(x);
+        state.center_y_dd = DD(y);
+        state.zoom = zoom;
+        state.angle = angle;
+
+        // Increase iterations as we zoom deeper
+        int suggested_iter = 256 + (int)(log10(std::max(1.0, zoom)) * 50);
+        state.max_iter = std::min(2048, std::max(256, suggested_iter));
+
+        state.needs_redraw = true;
+
+        // Check if trajectory is complete
+        if (t >= 1.0) {
+            // Trajectory finished - disable auto mode (stay at target)
+            explorer.enabled = false;
+            explorer.trajectory_mode = false;
+        }
+        return;
+    }
+
+    // Regular auto exploration mode
     // Check if we've reached target zoom - find new point
     if (state.zoom >= explorer.target_zoom) {
         // Find new interesting point
@@ -2011,11 +2090,19 @@ bool parse_complex(const char* str, double& re, double& im) {
 void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("\nOptions:\n");
-    printf("  --pos <re+imi>     Starting position (e.g., -0.5+0.3i)\n");
-    printf("  --zoom <value>     Starting zoom level (e.g., 1e6)\n");
-    printf("  --angle <degrees>  Starting view angle (e.g., 45)\n");
-    printf("  --auto             Enable automatic exploration mode\n");
+    printf("  --pos <re+imi>     Target position (e.g., -0.5+0.3i)\n");
+    printf("  --zoom <value>     Target zoom level (e.g., 1e6)\n");
+    printf("  --angle <degrees>  Target view angle (e.g., 45)\n");
+    printf("  --auto [N]         Enable automatic exploration, or with --pos/--zoom:\n");
+    printf("                     animate from default to target over N seconds (default 30)\n");
     printf("  --help             Show this help message\n");
+    printf("\nExamples:\n");
+    printf("  %s --pos -0.7+0.3i --zoom 1e6\n", prog);
+    printf("      Start at specified position and zoom\n");
+    printf("  %s --auto\n", prog);
+    printf("      Automatic exploration mode\n");
+    printf("  %s --pos -0.7+0.3i --zoom 1e11 --auto 60\n", prog);
+    printf("      Animate from default to target over 60 seconds\n");
     printf("\nControls:\n");
     printf("  Arrow Keys          - Pan view\n");
     printf("  SHIFT + Up/Down     - Zoom in/out\n");
@@ -2037,11 +2124,18 @@ int main(int argc, char* argv[]) {
     g_state = &state;
 
     // Parse command line arguments
+    // Track if --pos or --zoom were specified (for trajectory mode)
+    bool has_target_pos = false;
+    bool has_target_zoom = false;
+    double cli_target_x = -0.5, cli_target_y = 0.0;
+    double cli_target_zoom = 1.0;
+    double cli_target_angle = 0.0;
+
     static struct option long_options[] = {
         {"pos",   required_argument, 0, 'p'},
         {"zoom",  required_argument, 0, 'z'},
         {"angle", required_argument, 0, 'a'},
-        {"auto",  no_argument,       0, 'A'},
+        {"auto",  optional_argument, 0, 'A'},
         {"help",  no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2053,6 +2147,10 @@ int main(int argc, char* argv[]) {
             case 'p': {
                 double re, im;
                 if (parse_complex(optarg, re, im)) {
+                    cli_target_x = re;
+                    cli_target_y = im;
+                    has_target_pos = true;
+                    // Set state immediately (will be overridden if trajectory mode)
                     state.center_x = re;
                     state.center_y = im;
                     state.center_x_dd = DD(re);
@@ -2071,6 +2169,8 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "Error: Invalid zoom value '%s'\n", optarg);
                     return 1;
                 }
+                cli_target_zoom = zoom;
+                has_target_zoom = true;
                 state.zoom = zoom;
                 break;
             }
@@ -2081,18 +2181,28 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "Error: Invalid angle value '%s'\n", optarg);
                     return 1;
                 }
-                state.angle = angle_deg * M_PI / 180.0;
+                cli_target_angle = angle_deg * M_PI / 180.0;
+                state.angle = cli_target_angle;
                 break;
             }
             case 'A':
                 explorer.enabled = true;
-                // In auto mode, start with finding an interesting point
-                {
-                    auto [new_x, new_y] = find_interesting_point(explorer);
-                    state.center_x = new_x;
-                    state.center_y = new_y;
-                    state.center_x_dd = DD(new_x);
-                    state.center_y_dd = DD(new_y);
+                // Parse optional duration argument (e.g., --auto 60 or --auto=60)
+                if (optarg) {
+                    // Handle --auto=60 syntax (optarg is set)
+                    char* end;
+                    double duration = strtod(optarg, &end);
+                    if (end != optarg && duration > 0) {
+                        explorer.trajectory_duration = duration;
+                    }
+                } else if (optind < argc && argv[optind] && argv[optind][0] != '-') {
+                    // Handle --auto 60 syntax (optarg not set, check next argv)
+                    char* end;
+                    double duration = strtod(argv[optind], &end);
+                    if (end != argv[optind] && *end == '\0' && duration > 0) {
+                        explorer.trajectory_duration = duration;
+                        optind++;  // Consume the duration argument
+                    }
                 }
                 break;
             case 'h':
@@ -2102,6 +2212,41 @@ int main(int argc, char* argv[]) {
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    // Set up trajectory mode if --auto combined with --pos or --zoom
+    if (explorer.enabled && (has_target_pos || has_target_zoom)) {
+        // Trajectory mode: animate from default start to specified target
+        explorer.trajectory_mode = true;
+
+        // Store target values
+        explorer.traj_target_x = cli_target_x;
+        explorer.traj_target_y = cli_target_y;
+        explorer.traj_target_zoom = cli_target_zoom;
+        explorer.traj_target_angle = cli_target_angle;
+
+        // Cache log values for zoom interpolation (avoids per-frame log() calls)
+        explorer.log_start_zoom = log(explorer.start_zoom);
+        explorer.log_target_zoom = log(explorer.traj_target_zoom);
+
+        // Reset state to defaults (start of trajectory)
+        state.center_x = explorer.start_x;
+        state.center_y = explorer.start_y;
+        state.center_x_dd = DD(explorer.start_x);
+        state.center_y_dd = DD(explorer.start_y);
+        state.zoom = explorer.start_zoom;
+        state.angle = explorer.start_angle;
+
+        // Clear pan offset to ensure view matches interpolated path
+        state.pan_offset_x = DD(0.0);
+        state.pan_offset_y = DD(0.0);
+    } else if (explorer.enabled) {
+        // Regular auto mode: find interesting point and start exploring
+        auto [new_x, new_y] = find_interesting_point(explorer);
+        state.center_x = new_x;
+        state.center_y = new_y;
+        state.center_x_dd = DD(new_x);
+        state.center_y_dd = DD(new_y);
     }
 
     setup_terminal();
