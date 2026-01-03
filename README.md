@@ -12,6 +12,7 @@ Ultra-fast console-based Mandelbrot fractal explorer with deep zoom capabilities
 - **Smooth Animation**: Trajectory mode with ease-in-out cubic easing
 - **Multiple Color Schemes**: 9 built-in palettes with rotation support
 - **Real-time Navigation**: Pan, zoom, and rotate interactively
+- **iTerm2 Image Mode**: High-resolution rendering using iTerm2 inline images
 
 ## Building
 
@@ -50,6 +51,7 @@ make native
 | `--zoom <value>` | Target zoom level (e.g., `1e6`) |
 | `--angle <degrees>` | Target view angle (e.g., `45`) |
 | `--auto [N]` | Auto exploration, or trajectory over N seconds |
+| `--image [WxH]` | iTerm2 image mode (e.g., `--image=800x600`) |
 | `--help` | Show help message |
 
 ### Interactive Controls
@@ -62,6 +64,7 @@ make native
 | C/V | Rotate color palette |
 | 1-9 | Switch color schemes |
 | +/- | Adjust max iterations |
+| I | Toggle iTerm2 image mode |
 | R | Reset view |
 | Q/ESC | Quit |
 
@@ -83,11 +86,16 @@ Double-double uses two `double` values to achieve ~31 decimal digits of precisio
 
 When built with `-mavx2`, the explorer processes 4 pixels simultaneously using SIMD instructions, providing significant speedup on modern CPUs.
 
+### iTerm2 Image Mode
+
+When running in iTerm2 (detected via `LC_TERMINAL` or `ITERM_SESSION_ID`), the explorer can render using iTerm2's inline image protocol. This provides much higher resolution output (default 640x400 pixels) compared to terminal character cells. The image is encoded as PPM and transmitted via base64.
+
 ## Requirements
 
 - C++17 compiler (clang++ or g++)
 - POSIX terminal with ANSI escape code support
 - Optional: CPU with AVX2 for SIMD acceleration
+- Optional: iTerm2 for high-resolution image mode
 
 ## License
 
