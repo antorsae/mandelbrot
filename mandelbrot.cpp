@@ -9,6 +9,7 @@
  *   C/V                 - Rotate color palette
  *   1-9                 - Switch color schemes
  *   +/-                 - Increase/decrease max iterations
+ *   I                   - Toggle iTerm2 image mode (higher resolution)
  *   R                   - Reset view
  *   Q/ESC               - Quit
  *
@@ -17,6 +18,7 @@
  *   --zoom <value>      - Target zoom level
  *   --angle <degrees>   - Target view angle
  *   --auto [N]          - Auto mode, or trajectory to --pos/--zoom over N sec
+ *   --image [WxH]       - Enable iTerm2 inline image mode
  */
 
 #include <cstdio>
@@ -514,6 +516,12 @@ struct MandelbrotState {
     // Stored in SCREEN coordinates - rotated to world coords when committed or displayed.
     DD pan_offset_x{0.0};
     DD pan_offset_y{0.0};
+
+    // iTerm2 inline image mode - renders as actual pixels instead of block characters
+    bool iterm_image_mode = false;
+    int image_width = 640;   // Pixel width when in image mode
+    int image_height = 400;  // Pixel height when in image mode
+    std::vector<uint8_t> image_buffer;  // RGB buffer for image output
 
     // Sync DD and double centers (for display/compatibility)
     // Note: center_x/y are doubles, so we sum hi+lo for best approximation
@@ -1408,7 +1416,135 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
 // Block characters for half-height pixels
 const char* BLOCKS[] = {" ", "▄", "▀", "█"};
 
+// ═══════════════════════════════════════════════════════════════════════════
+// iTerm2 INLINE IMAGE SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Base64 encoding for iTerm2 inline images
+static const char base64_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const uint8_t* data, size_t len) {
+    std::string result;
+    result.reserve((len + 2) / 3 * 4);
+
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t n = data[i] << 16;
+        if (i + 1 < len) n |= data[i + 1] << 8;
+        if (i + 2 < len) n |= data[i + 2];
+
+        result += base64_chars[(n >> 18) & 0x3F];
+        result += base64_chars[(n >> 12) & 0x3F];
+        result += (i + 1 < len) ? base64_chars[(n >> 6) & 0x3F] : '=';
+        result += (i + 2 < len) ? base64_chars[n & 0x3F] : '=';
+    }
+    return result;
+}
+
+// Check if running in iTerm2 (works even through tmux)
+bool detect_iterm2() {
+    const char* lc_terminal = getenv("LC_TERMINAL");
+    if (lc_terminal && strcmp(lc_terminal, "iTerm2") == 0) return true;
+    const char* iterm_session = getenv("ITERM_SESSION_ID");
+    if (iterm_session && strlen(iterm_session) > 0) return true;
+    return false;
+}
+
+// Compute mandelbrot at image resolution (higher than terminal cells)
+void compute_mandelbrot_image(MandelbrotState& state) {
+    // Save original dimensions
+    int orig_width = state.width;
+    int orig_height = state.height;
+    auto orig_iterations = std::move(state.iterations);
+
+    // Set to image dimensions
+    state.width = state.image_width;
+    state.height = state.image_height;
+    state.iterations.resize(state.width * state.height);
+
+    // Compute using existing infrastructure
+    compute_mandelbrot_unified(state);
+
+    // Generate RGB buffer
+    ColorFunc get_color = color_schemes[state.color_scheme];
+    state.image_buffer.resize(state.width * state.height * 3);
+
+    for (int y = 0; y < state.height; y++) {
+        for (int x = 0; x < state.width; x++) {
+            double iter = state.iterations[y * state.width + x];
+            RGB color;
+            if (iter < 0) {
+                color = {0, 0, 0};
+            } else {
+                double t = fmod(iter / 64.0, 1.0);
+                color = get_color(t, state.color_rotation);
+            }
+            size_t idx = (y * state.width + x) * 3;
+            state.image_buffer[idx] = color.r;
+            state.image_buffer[idx + 1] = color.g;
+            state.image_buffer[idx + 2] = color.b;
+        }
+    }
+
+    // Restore original dimensions for terminal rendering fallback
+    state.width = orig_width;
+    state.height = orig_height;
+    state.iterations = std::move(orig_iterations);
+}
+
+// Create PPM image data (simple format, no library needed)
+std::vector<uint8_t> create_ppm(const uint8_t* rgb, int width, int height) {
+    std::vector<uint8_t> ppm;
+    char header[64];
+    int hlen = snprintf(header, sizeof(header), "P6\n%d %d\n255\n", width, height);
+    ppm.insert(ppm.end(), header, header + hlen);
+    ppm.insert(ppm.end(), rgb, rgb + width * height * 3);
+    return ppm;
+}
+
+// Output image using iTerm2 inline image protocol
+// Protocol: ESC ] 1337 ; File = [args] : base64_data BEL
+void render_iterm2_image(MandelbrotState& state) {
+    // Compute at image resolution
+    compute_mandelbrot_image(state);
+
+    // Create PPM image
+    auto ppm = create_ppm(state.image_buffer.data(), state.image_width, state.image_height);
+
+    // Base64 encode
+    std::string b64 = base64_encode(ppm.data(), ppm.size());
+
+    // Output using iTerm2 protocol
+    // Move cursor home, then output image
+    printf(CURSOR_HOME);
+    printf("\033]1337;File=inline=1;width=auto;height=auto;preserveAspectRatio=1:");
+    printf("%s", b64.c_str());
+    printf("\007");  // BEL character
+
+    // Status bar below image (move down based on terminal height)
+    char status[640];
+    const char* mode_str = state.use_perturbation ? "PERTURB" : "DOUBLE";
+    double angle_deg = state.angle * 180.0 / M_PI;
+    DD eff_x = state.effective_center_x();
+    DD eff_y = state.effective_center_y();
+    double display_x = eff_x.hi + eff_x.lo;
+    double display_y = eff_y.hi + eff_y.lo;
+    snprintf(status, sizeof(status),
+        "\n" BOLD " ═══ MANDELBROT [%dx%d] ═══ " RESET
+        " │ Pos: %.10g%+.10gi │ Zoom: %.2e │ Angle: %.1f° │ [%s]",
+        state.image_width, state.image_height,
+        display_x, display_y, state.zoom, angle_deg, mode_str);
+    printf("%s", status);
+    fflush(stdout);
+}
+
 void render_frame(MandelbrotState& state) {
+    // Use iTerm2 inline image mode if enabled
+    if (state.iterm_image_mode) {
+        render_iterm2_image(state);
+        return;
+    }
+
     ColorFunc get_color = color_schemes[state.color_scheme];
 
     std::string& out = state.output_buffer;
@@ -1536,7 +1672,7 @@ enum Key {
     KEY_Q, KEY_R, KEY_ESC,
     KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
     KEY_PLUS, KEY_MINUS,
-    KEY_C, KEY_V
+    KEY_C, KEY_V, KEY_I
 };
 
 Key read_key() {
@@ -1547,6 +1683,7 @@ Key read_key() {
     if (c == 'r' || c == 'R') return KEY_R;
     if (c == 'c' || c == 'C') return KEY_C;
     if (c == 'v' || c == 'V') return KEY_V;
+    if (c == 'i' || c == 'I') return KEY_I;
     if (c == '+' || c == '=') return KEY_PLUS;
     if (c == '-' || c == '_') return KEY_MINUS;
     if (c >= '1' && c <= '9') return (Key)(KEY_1 + (c - '1'));
@@ -1702,6 +1839,14 @@ void handle_input(MandelbrotState& state) {
             state.color_rotation = 0.0;
             state.use_perturbation = false;
             state.needs_redraw = true;
+            break;
+
+        case KEY_I:
+            // Toggle iTerm2 image mode (only if iTerm2 is available)
+            if (detect_iterm2()) {
+                state.iterm_image_mode = !state.iterm_image_mode;
+                state.needs_redraw = true;
+            }
             break;
 
         case KEY_Q:
@@ -2403,6 +2548,8 @@ void print_usage(const char* prog) {
     printf("  --angle <degrees>  Target view angle (e.g., 45)\n");
     printf("  --auto [N]         Enable automatic exploration, or with --pos/--zoom:\n");
     printf("                     animate from default to target over N seconds (default 30)\n");
+    printf("  --image [WxH]      Enable iTerm2 inline image mode (requires iTerm2)\n");
+    printf("                     Optional resolution, e.g., --image=800x600 (default 640x400)\n");
     printf("  --help             Show this help message\n");
     printf("\nDebug options:\n");
     printf("  --debug            Print DD precision values to stderr at parse and exit\n");
@@ -2421,6 +2568,7 @@ void print_usage(const char* prog) {
     printf("  C/V                 - Rotate color palette\n");
     printf("  1-9                 - Switch color schemes\n");
     printf("  +/-                 - Adjust max iterations\n");
+    printf("  I                   - Toggle iTerm2 image mode (higher resolution)\n");
     printf("  R                   - Reset view\n");
     printf("  Q/ESC               - Quit\n");
 }
@@ -2451,6 +2599,7 @@ int main(int argc, char* argv[]) {
         {"zoom",  required_argument, 0, 'z'},
         {"angle", required_argument, 0, 'a'},
         {"auto",  optional_argument, 0, 'A'},
+        {"image", optional_argument, 0, 'I'},
         {"debug", no_argument,       0, 'D'},
         {"exit-now", no_argument,    0, 'X'},
         {"help",  no_argument,       0, 'h'},
@@ -2530,6 +2679,24 @@ int main(int argc, char* argv[]) {
                         explorer.trajectory_duration = duration;
                         optind++;  // Consume the duration argument
                     }
+                }
+                break;
+            case 'I':
+                // Enable iTerm2 image mode (auto-detect or force)
+                if (detect_iterm2()) {
+                    state.iterm_image_mode = true;
+                    // Parse optional resolution argument (e.g., --image=800x600)
+                    if (optarg) {
+                        int w, h;
+                        if (sscanf(optarg, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                            state.image_width = w;
+                            state.image_height = h;
+                        }
+                    }
+                    fprintf(stderr, "iTerm2 detected: image mode enabled (%dx%d)\n",
+                            state.image_width, state.image_height);
+                } else {
+                    fprintf(stderr, "Warning: iTerm2 not detected, --image requires iTerm2\n");
                 }
                 break;
             case 'D':
