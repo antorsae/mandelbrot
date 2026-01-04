@@ -71,7 +71,9 @@ struct ReferenceOrbit {
     std::vector<double> SA_Ar, SA_Ai;
     std::vector<double> SA_Br, SA_Bi;
     std::vector<double> SA_Cr, SA_Ci;
+    std::vector<double> SA_Dr, SA_Di;
     std::vector<double> SA_A_norm;
+    std::vector<double> SA_D_norm;
     int length = 0;
     int escape_iter = -1;
     bool sa_enabled = false;
@@ -81,7 +83,9 @@ struct ReferenceOrbit {
         SA_Ar.clear(); SA_Ai.clear();
         SA_Br.clear(); SA_Bi.clear();
         SA_Cr.clear(); SA_Ci.clear();
+        SA_Dr.clear(); SA_Di.clear();
         SA_A_norm.clear();
+        SA_D_norm.clear();
         length = 0;
         escape_iter = -1;
         sa_enabled = false;
@@ -99,6 +103,7 @@ void compute_reference_orbit(ReferenceOrbit& orbit, DD center_x, DD center_y,
     double Ar = 0, Ai = 0;
     double Br = 0, Bi = 0;
     double Cr = 0, Ci = 0;
+    double Dr = 0, Di = 0;
 
     orbit.Zr_sum.push_back(0);
     orbit.Zi_sum.push_back(0);
@@ -108,7 +113,10 @@ void compute_reference_orbit(ReferenceOrbit& orbit, DD center_x, DD center_y,
     orbit.SA_Bi.push_back(0);
     orbit.SA_Cr.push_back(0);
     orbit.SA_Ci.push_back(0);
+    orbit.SA_Dr.push_back(0);
+    orbit.SA_Di.push_back(0);
     orbit.SA_A_norm.push_back(0);
+    orbit.SA_D_norm.push_back(0);
 
     for (int n = 0; n < max_iter; n++) {
         // Z_{n+1} = Z_n² + C
@@ -144,9 +152,18 @@ void compute_reference_orbit(ReferenceOrbit& orbit, DD center_x, DD center_y,
         double new_Cr = 2.0 * (Zr_prev * Cr - Zi_prev * Ci) + 2.0 * ABr;
         double new_Ci = 2.0 * (Zr_prev * Ci + Zi_prev * Cr) + 2.0 * ABi;
 
+        // D_{n+1} = 2*Z_n*D_n + (2*A_n*C_n + B_n²)
+        double ACr = Ar * Cr - Ai * Ci;
+        double ACi = Ar * Ci + Ai * Cr;
+        double B2r = Br * Br - Bi * Bi;
+        double B2i = 2.0 * Br * Bi;
+        double new_Dr = 2.0 * (Zr_prev * Dr - Zi_prev * Di) + 2.0 * ACr + B2r;
+        double new_Di = 2.0 * (Zr_prev * Di + Zi_prev * Dr) + 2.0 * ACi + B2i;
+
         Ar = new_Ar; Ai = new_Ai;
         Br = new_Br; Bi = new_Bi;
         Cr = new_Cr; Ci = new_Ci;
+        Dr = new_Dr; Di = new_Di;
 
         orbit.SA_Ar.push_back(Ar);
         orbit.SA_Ai.push_back(Ai);
@@ -154,7 +171,10 @@ void compute_reference_orbit(ReferenceOrbit& orbit, DD center_x, DD center_y,
         orbit.SA_Bi.push_back(Bi);
         orbit.SA_Cr.push_back(Cr);
         orbit.SA_Ci.push_back(Ci);
+        orbit.SA_Dr.push_back(Dr);
+        orbit.SA_Di.push_back(Di);
         orbit.SA_A_norm.push_back(Ar * Ar + Ai * Ai);
+        orbit.SA_D_norm.push_back(Dr * Dr + Di * Di);
 
         double norm = Zr_d * Zr_d + Zi_d * Zi_d;
         if (norm > 1e6) {
@@ -196,29 +216,35 @@ int sa_find_skip_iteration(const ReferenceOrbit& orbit,
     int max_check = std::min(max_iter, orbit.length - 1);
     int best_skip = 0;
 
+    // Lambda to check validity at iteration n
+    // For 4-term SA: |D|² * |δC|⁶ < ε² * |A|²
+    auto is_valid = [&](int n) -> bool {
+        if (n < 1 || n > max_check) return false;
+        double D_norm = orbit.SA_D_norm[n];
+        double A_norm = orbit.SA_A_norm[n];
+        if (!std::isfinite(D_norm) || !std::isfinite(A_norm) || A_norm == 0.0)
+            return false;
+        double dC_norm_cubed = dC_norm * dC_norm * dC_norm;
+        double lhs = D_norm * dC_norm_cubed;
+        double rhs = SA_TOLERANCE * SA_TOLERANCE * A_norm;
+        return lhs < rhs;
+    };
+
     int lo = 1, hi = max_check;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-
-        double Cr = orbit.SA_Cr[mid];
-        double Ci = orbit.SA_Ci[mid];
-        double C_norm = Cr * Cr + Ci * Ci;
-        double A_norm = orbit.SA_A_norm[mid];
-
-        if (!std::isfinite(C_norm) || !std::isfinite(A_norm) || A_norm == 0.0) {
-            hi = mid - 1;
-            continue;
-        }
-
-        // Validity check: |C|² * |δC|⁴ < ε² * |A|²
-        double lhs = C_norm * dC_norm * dC_norm;
-        double rhs = SA_TOLERANCE * SA_TOLERANCE * A_norm;
-
-        if (lhs < rhs) {
+        if (is_valid(mid)) {
             best_skip = mid;
             lo = mid + 1;
         } else {
             hi = mid - 1;
+        }
+    }
+
+    // Validate best_skip - if non-monotonic, scan backward
+    if (best_skip > 0 && !is_valid(best_skip)) {
+        while (best_skip > 0 && !is_valid(best_skip)) {
+            best_skip--;
         }
     }
 
@@ -229,11 +255,15 @@ int sa_find_skip_iteration(const ReferenceOrbit& orbit,
         double Bi = orbit.SA_Bi[best_skip];
         double Cr = orbit.SA_Cr[best_skip];
         double Ci = orbit.SA_Ci[best_skip];
+        double Dr = orbit.SA_Dr[best_skip];
+        double Di = orbit.SA_Di[best_skip];
 
         double dC2r = dCr * dCr - dCi * dCi;
         double dC2i = 2.0 * dCr * dCi;
         double dC3r = dC2r * dCr - dC2i * dCi;
         double dC3i = dC2r * dCi + dC2i * dCr;
+        double dC4r = dC3r * dCr - dC3i * dCi;
+        double dC4i = dC3r * dCi + dC3i * dCr;
 
         double term1r = Ar * dCr - Ai * dCi;
         double term1i = Ar * dCi + Ai * dCr;
@@ -241,9 +271,11 @@ int sa_find_skip_iteration(const ReferenceOrbit& orbit,
         double term2i = Br * dC2i + Bi * dC2r;
         double term3r = Cr * dC3r - Ci * dC3i;
         double term3i = Cr * dC3i + Ci * dC3r;
+        double term4r = Dr * dC4r - Di * dC4i;
+        double term4i = Dr * dC4i + Di * dC4r;
 
-        dzr_out = term1r + term2r + term3r;
-        dzi_out = term1i + term2i + term3i;
+        dzr_out = term1r + term2r + term3r + term4r;
+        dzi_out = term1i + term2i + term3i + term4i;
 
         if (!std::isfinite(dzr_out) || !std::isfinite(dzi_out)) {
             dzr_out = 0.0;
