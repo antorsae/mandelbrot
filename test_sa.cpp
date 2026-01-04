@@ -9,6 +9,7 @@
 #include <chrono>
 #include <vector>
 #include <cstring>
+#include <string>
 
 // Include the main implementation (we'll extract what we need)
 // For testing, we compile a standalone version
