@@ -281,7 +281,8 @@ constexpr double GLITCH_RATE_LIMIT = 0.15;      // Max glitch rate before DD fal
 // Also computes Series Approximation (SA) coefficients for iteration skipping
 inline void compute_reference_orbit(ReferenceOrbit& orbit,
                                     DD center_x, DD center_y,
-                                    int max_iter) {
+                                    int max_iter,
+                                    bool enable_sa = true) {
     orbit.clear();
     orbit.center_re = center_x;
     orbit.center_im = center_y;
@@ -402,14 +403,14 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
         if (norm > 1e6) {
             orbit.escape_iter = n + 1;
             orbit.length = n + 2;
-            orbit.sa_enabled = true;
+            orbit.sa_enabled = enable_sa;
             return;
         }
     }
 
     orbit.escape_iter = -1;  // Didn't escape
     orbit.length = max_iter + 1;
-    orbit.sa_enabled = true;
+    orbit.sa_enabled = enable_sa;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -465,8 +466,9 @@ inline int sa_find_skip_iteration(const ReferenceOrbit& orbit,
             continue;
         }
 
-        // Validity check: |C|² * |δC|² < ε² * |A|²
-        double lhs = C_norm * dC_norm;
+        // Validity check: |C|² * |δC|⁴ < ε² * |A|²
+        // (derived from |C*δC³| << ε*|A*δC|, i.e., |C|*|δC|² < ε*|A|)
+        double lhs = C_norm * dC_norm * dC_norm;
         double rhs = SA_TOLERANCE * SA_TOLERANCE * A_norm;
 
         if (lhs < rhs) {
@@ -727,6 +729,9 @@ struct MandelbrotState {
     int image_width = 640;   // Pixel width when in image mode
     int image_height = 400;  // Pixel height when in image mode
     std::vector<uint8_t> image_buffer;  // RGB buffer for image output
+
+    // Series Approximation control
+    bool disable_sa = false;  // Disable SA for benchmarking
 
     // Sync DD and double centers (for display/compatibility)
     // Note: center_x/y are doubles, so we sum hi+lo for best approximation
@@ -1493,7 +1498,7 @@ void handle_glitches(MandelbrotState& state) {
         ReferenceOrbit new_orbit;
         DD new_center_x = pixel_to_dd_x(gx, gy, state);
         DD new_center_y = pixel_to_dd_y(gx, gy, state);
-        compute_reference_orbit(new_orbit, new_center_x, new_center_y, state.max_iter);
+        compute_reference_orbit(new_orbit, new_center_x, new_center_y, state.max_iter, !state.disable_sa);
 
         // Recompute only glitched pixels with new reference
         double aspect = (double)state.width / (state.height * 2.0);
@@ -1651,7 +1656,8 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
         // are tiny values at extreme zoom (same order of magnitude)
         compute_reference_orbit(state.primary_orbit,
                                state.center_x_dd, state.center_y_dd,
-                               effective_max_iter);
+                               effective_max_iter,
+                               !state.disable_sa);
 
         // Temporarily use scaled iterations for perturbation
         int saved_max_iter = state.max_iter;
@@ -2809,6 +2815,8 @@ void print_usage(const char* prog) {
     printf("                     animate from default to target over N seconds (default 30)\n");
     printf("  --image [WxH]      Enable iTerm2 inline image mode (requires iTerm2)\n");
     printf("                     Optional resolution, e.g., --image=800x600 (default 640x400)\n");
+    printf("  --benchmark        Compute one frame and print timing (no interactive mode)\n");
+    printf("  --no-sa            Disable Series Approximation (for benchmarking)\n");
     printf("  --help             Show this help message\n");
     printf("\nDebug options:\n");
     printf("  --debug            Print DD precision values to stderr at parse and exit\n");
@@ -2852,6 +2860,8 @@ int main(int argc, char* argv[]) {
     double cli_target_angle = 0.0;
     bool debug_dd = false;
     bool exit_now = false;  // Exit immediately after parsing (for testing)
+    bool benchmark_mode = false;  // Compute one frame and print timing
+    bool disable_sa = false;      // Disable Series Approximation
 
     static struct option long_options[] = {
         {"pos",   required_argument, 0, 'p'},
@@ -2859,6 +2869,8 @@ int main(int argc, char* argv[]) {
         {"angle", required_argument, 0, 'a'},
         {"auto",  optional_argument, 0, 'A'},
         {"image", optional_argument, 0, 'I'},
+        {"benchmark", no_argument,   0, 'B'},
+        {"no-sa", no_argument,       0, 'S'},
         {"debug", no_argument,       0, 'D'},
         {"exit-now", no_argument,    0, 'X'},
         {"help",  no_argument,       0, 'h'},
@@ -2958,6 +2970,12 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "Warning: iTerm2 not detected, --image requires iTerm2\n");
                 }
                 break;
+            case 'B':
+                benchmark_mode = true;
+                break;
+            case 'S':
+                disable_sa = true;
+                break;
             case 'D':
                 debug_dd = true;
                 break;
@@ -2973,6 +2991,9 @@ int main(int argc, char* argv[]) {
                 return 1;
         }
     }
+
+    // Apply disable_sa to state
+    state.disable_sa = disable_sa;
 
     // Debug: Print parsed DD values
     if (debug_dd && has_target_pos) {
@@ -3028,6 +3049,52 @@ int main(int argc, char* argv[]) {
         state.center_y = new_y;
         state.center_x_dd = DD(new_x);
         state.center_y_dd = DD(new_y);
+    }
+
+    // Benchmark mode: compute one frame and print timing
+    if (benchmark_mode) {
+        // Set up dimensions
+        state.width = state.iterm_image_mode ? state.image_width : 80;
+        state.height = state.iterm_image_mode ? state.image_height : 48;
+        state.iterations.resize(state.width * state.height);
+        state.image_buffer.resize(state.width * state.height * 3);
+
+        // Scale max_iter with zoom (same as normal mode)
+        int suggested_iter = 256 + (int)(log10(std::max(1.0, state.zoom)) * 50);
+        state.max_iter = std::min(2048, std::max(256, suggested_iter));
+
+        // Run 3 iterations for warm-up + averaging
+        const int RUNS = 3;
+        double times[RUNS];
+
+        fprintf(stderr, "Benchmark: %dx%d, zoom=%.2e, SA=%s, max_iter=%d\n",
+                state.width, state.height, state.zoom,
+                disable_sa ? "OFF" : "ON", state.max_iter);
+
+        for (int r = 0; r < RUNS; r++) {
+            state.needs_redraw = true;
+            auto start = std::chrono::high_resolution_clock::now();
+            compute_mandelbrot_unified(state);
+            auto end = std::chrono::high_resolution_clock::now();
+            times[r] = std::chrono::duration<double>(end - start).count();
+            fprintf(stderr, "  Run %d: %.3fs\n", r + 1, times[r]);
+        }
+
+        double avg = (times[0] + times[1] + times[2]) / 3.0;
+        fprintf(stderr, "Average: %.3fs\n", avg);
+
+        // Show SA skip info if perturbation was used
+        if (state.use_perturbation && !disable_sa) {
+            double aspect = (double)state.width / (state.height * 2.0);
+            double scale = 3.0 / state.zoom;
+            double dCr = scale * aspect * 0.1;
+            double dCi = scale * 0.1;
+            double dzr, dzi;
+            int skip = sa_find_skip_iteration(state.primary_orbit, dCr, dCi, dzr, dzi, state.max_iter);
+            fprintf(stderr, "SA skip: %d of %d iterations (%.1f%%)\n",
+                    skip, state.max_iter, 100.0 * skip / state.max_iter);
+        }
+        return 0;
     }
 
     setup_terminal();
