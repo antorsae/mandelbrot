@@ -7,7 +7,7 @@ Ultra-fast console-based Mandelbrot fractal explorer with deep zoom capabilities
 ## Features
 
 - **Deep Zoom**: Explore to zoom levels beyond 10^30 using perturbation theory
-- **Series Approximation**: ~4500x speedup at deep zoom by skipping iterations
+- **Series Approximation**: ~1000x theoretical speedup at deep zoom via 4-term polynomial
 - **Double-Double Precision**: ~31 decimal digits of precision for reference orbit computation
 - **AVX2 SIMD**: Optional 4x parallel pixel computation on supported CPUs
 - **Smooth Animation**: Trajectory mode with ease-in-out cubic easing
@@ -78,14 +78,20 @@ make native
 At deep zoom, most pixels follow nearly identical iteration paths. Series Approximation exploits this by computing polynomial coefficients that approximate the perturbation:
 
 ```
-δZ_n ≈ A_n * δC + B_n * δC² + C_n * δC³
+δZ_n ≈ A_n * δC + B_n * δC² + C_n * δC³ + D_n * δC⁴
 ```
 
-Instead of iterating each pixel individually, SA evaluates this polynomial to skip directly to a later iteration. At zoom 1e12, SA typically skips 100% of iterations, providing **~4500x speedup**.
+The coefficients follow recurrence relations derived from the Mandelbrot iteration:
+- `A_{n+1} = 2*Z_n*A_n + 1`
+- `B_{n+1} = 2*Z_n*B_n + A_n²`
+- `C_{n+1} = 2*Z_n*C_n + 2*A_n*B_n`
+- `D_{n+1} = 2*Z_n*D_n + 2*A_n*C_n + B_n²`
+
+Instead of iterating each pixel individually, SA evaluates this polynomial to skip directly to a later iteration. At zoom 1e12, SA typically skips 100% of iterations, providing **~1000x theoretical speedup**.
 
 The validity check ensures the approximation error stays below tolerance:
 ```
-|C_n| * |δC|² < ε * |A_n|
+|D_n|² * |δC|⁶ < ε² * |A_n|²
 ```
 
 ### Perturbation Theory
