@@ -1,6 +1,9 @@
 // Series Approximation (SA) Tests
 // Tests correctness and speedup of SA vs non-SA implementation
 //
+// Note: BLA (Bilinear Approximation) is tested via test_perturbation.cpp
+// which does full pixel comparisons including BLA iteration skipping.
+//
 // Build: make test_sa
 // Run:   ./test_sa
 

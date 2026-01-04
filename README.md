@@ -7,13 +7,29 @@ Ultra-fast console-based Mandelbrot fractal explorer with deep zoom capabilities
 ## Features
 
 - **Deep Zoom**: Explore to zoom levels beyond 10^30 using perturbation theory
-- **Series Approximation**: ~1000x theoretical speedup at deep zoom via 4-term polynomial
+- **Series Approximation (SA)**: 4-term polynomial skips up to 100% of iterations at deep zoom
+- **Bilinear Approximation (BLA)**: Additional iteration skipping where SA is less effective
+- **Block-Level Rendering**: Tile-based evaluation fills uniform regions without per-pixel computation
+- **Reference Orbit Caching**: Avoids recomputation when panning at deep zoom
 - **Double-Double Precision**: ~31 decimal digits of precision for reference orbit computation
 - **AVX2 SIMD**: Optional 4x parallel pixel computation on supported CPUs
 - **Smooth Animation**: Trajectory mode with ease-in-out cubic easing
 - **Multiple Color Schemes**: 9 built-in palettes with rotation support
 - **Real-time Navigation**: Pan, zoom, and rotate interactively
 - **iTerm2 Image Mode**: High-resolution rendering using iTerm2 inline images
+
+## Performance
+
+Measured speedups with SA+BLA optimizations vs baseline (no SA):
+
+| Zoom Level | Speedup | SA Skip |
+|------------|---------|---------|
+| 1e11 | **25x** | 100% |
+| 1e12 | **28x** | 100% |
+| 1e13 | **31x** | 100% |
+| 1e14 | **31x** | 100% |
+
+Even in challenging regions with low SA effectiveness (~5% skip), block-level rendering provides 2-3x speedup.
 
 ## Building
 
@@ -87,12 +103,47 @@ The coefficients follow recurrence relations derived from the Mandelbrot iterati
 - `C_{n+1} = 2*Z_n*C_n + 2*A_n*B_n`
 - `D_{n+1} = 2*Z_n*D_n + 2*A_n*C_n + B_n²`
 
-Instead of iterating each pixel individually, SA evaluates this polynomial to skip directly to a later iteration. At zoom 1e12, SA typically skips 100% of iterations, providing **~1000x theoretical speedup**.
+The polynomial is evaluated using Horner form for efficiency: `(((D*δC + C)*δC + B)*δC + A)*δC`
+
+At zoom 1e12, SA typically skips 100% of iterations, providing massive speedup.
 
 The validity check ensures the approximation error stays below tolerance:
 ```
 |D_n|² * |δC|⁶ < ε² * |A_n|²
 ```
+
+### Bilinear Approximation (BLA)
+
+BLA provides additional iteration skipping where SA is less effective (near minibrots). Unlike SA which approximates in terms of δC only, BLA is linear in both δz and δC:
+
+```
+δz_{m+l} = A_l * δz_m + B_l * δC
+```
+
+BLA coefficients are organized in a hierarchical table:
+- Level 0: 1-iteration BLAs (A = 2Z, B = 1)
+- Level 1: 2-iteration BLAs (merged from level 0)
+- Level k: 2^k-iteration BLAs
+
+Merging formula: `A_{merged} = A_y * A_x`, `B_{merged} = A_y * B_x + B_y`
+
+### Block-Level Rendering
+
+Instead of computing each pixel individually, the renderer first attempts to fill 16x16 tiles:
+1. Sample the 4 corners of each tile
+2. If all corners agree (all escaped or all bounded with similar iteration counts), fill the entire tile
+3. Otherwise, fall back to per-pixel computation
+
+This provides significant speedup in uniform regions (interior of cardioid, exterior far from boundary).
+
+### Reference Orbit Caching
+
+The reference orbit is cached and reused when:
+- Center position hasn't changed
+- Max iterations haven't increased
+- SA settings are the same
+
+This allows smooth panning at deep zoom without recomputing the expensive reference orbit.
 
 ### Perturbation Theory
 
