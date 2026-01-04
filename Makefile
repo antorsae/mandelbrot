@@ -18,7 +18,10 @@ TEST_TRAJ_SRC = test_trajectory.cpp
 TEST_SA_TARGET = test_sa
 TEST_SA_SRC = test_sa.cpp
 
-.PHONY: all clean run avx2 native test test-trajectory test-sa test-all
+TEST_FLAGS_TARGET = test_flags
+TEST_FLAGS_SRC = test_flags.cpp
+
+.PHONY: all clean run avx2 native test test-trajectory test-sa test-flags test-all
 
 all: $(TARGET)
 
@@ -44,7 +47,7 @@ run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -f $(TARGET) $(TEST_TARGET) $(TEST_TRAJ_TARGET) $(TEST_SA_TARGET)
+	rm -f $(TARGET) $(TEST_TARGET) $(TEST_TRAJ_TARGET) $(TEST_SA_TARGET) $(TEST_FLAGS_TARGET)
 
 # Debug build
 debug: CXXFLAGS = -std=c++17 -g -fsanitize=address
@@ -81,5 +84,12 @@ $(TEST_SA_TARGET): $(TEST_SA_SRC)
 test-sa: $(TEST_SA_TARGET)
 	./$(TEST_SA_TARGET)
 
+# Flag combination test build and run
+$(TEST_FLAGS_TARGET): $(TEST_FLAGS_SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
+
+test-flags: $(TARGET) $(TEST_FLAGS_TARGET)
+	./$(TEST_FLAGS_TARGET)
+
 # Run all tests
-test-all: test test-trajectory test-sa
+test-all: test test-trajectory test-sa test-flags

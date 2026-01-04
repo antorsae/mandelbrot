@@ -1829,10 +1829,14 @@ void compute_perturbation_threaded(MandelbrotState& state, const ReferenceOrbit&
 
     // Phase 1: Block-level SA pass - try to fill uniform tiles
     // This is done single-threaded for simplicity (tiles are fast to evaluate)
-    // Skip if block-level optimization is disabled
+    // Skip if block-level optimization is disabled or at extreme zoom
+    // At extreme zoom (pixel_size < 1e-15), block filling can introduce visible artifacts
+    // due to corner interpolation precision issues
     int tiles_filled = 0;
     int tiles_total = 0;
-    if (!state.disable_block) {
+    double pixel_size = 3.0 / state.zoom / state.width;
+    bool block_enabled = !state.disable_block && (pixel_size >= 1e-15);
+    if (block_enabled) {
         for (int ty = 0; ty < state.height; ty += TILE_SIZE) {
             for (int tx = 0; tx < state.width; tx += TILE_SIZE) {
                 tiles_total++;
@@ -2047,13 +2051,15 @@ void handle_glitches(MandelbrotState& state) {
         auto [gx, gy] = find_glitch_center(state);
 
         // Compute new reference at glitch center
+        // Auto-disable SA at deep zoom (>1e12) same as main orbit
         ReferenceOrbit new_orbit;
         DD new_center_x = pixel_to_dd_x(gx, gy, state);
         DD new_center_y = pixel_to_dd_y(gx, gy, state);
-        compute_reference_orbit(new_orbit, new_center_x, new_center_y, state.max_iter, !state.disable_sa);
+        bool enable_sa = !state.disable_sa && (state.zoom <= 1e12);
+        compute_reference_orbit(new_orbit, new_center_x, new_center_y, state.max_iter, enable_sa);
 
-        // Compute BLA table for the new reference
-        if (!state.disable_sa) {
+        // Compute BLA table for the new reference (independent of SA)
+        if (!state.disable_bla) {
             double pixel_size = 3.0 / state.zoom / state.width;
             double half_w = state.width / 2.0 * pixel_size;
             double half_h = state.height / 2.0 * pixel_size;
@@ -2221,22 +2227,27 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
                          state.cached_center_y.hi == state.center_y_dd.hi &&
                          state.cached_center_y.lo == state.center_y_dd.lo &&
                          state.cached_max_iter >= effective_max_iter &&
-                         state.cached_sa_enabled == !state.disable_sa;
+                         state.cached_sa_enabled == (!state.disable_sa && state.zoom <= 1e12);
 
         if (!cache_hit) {
             // Compute reference orbit at center_dd (not effective_center)
             // Pan offset is added to δC in perturbation loop - this allows panning without
             // recomputing reference orbit, and works because both pixel_offset and pan_offset
             // are tiny values at extreme zoom (same order of magnitude)
+            //
+            // Auto-disable SA at deep zoom (>1e12) where the 4-term polynomial
+            // approximation loses precision. BLA still works accurately at any zoom.
+            bool enable_sa = !state.disable_sa && (state.zoom <= 1e12);
             compute_reference_orbit(state.primary_orbit,
                                    state.center_x_dd, state.center_y_dd,
                                    effective_max_iter,
-                                   !state.disable_sa);
+                                   enable_sa);
 
-            // Compute BLA table if SA is enabled
+            // Compute BLA table (independent of SA)
+            // BLA can be used even when SA is disabled for iteration skipping
             // max_dC_norm is the maximum |δC|² for any pixel on screen
             // Half-diagonal of screen in complex plane
-            if (!state.disable_sa) {
+            if (!state.disable_bla) {
                 double pixel_size = 3.0 / state.zoom / state.width;
                 double half_w = state.width / 2.0 * pixel_size;
                 double half_h = state.height / 2.0 * pixel_size;
@@ -2249,7 +2260,7 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
             state.cached_center_x = state.center_x_dd;
             state.cached_center_y = state.center_y_dd;
             state.cached_max_iter = effective_max_iter;
-            state.cached_sa_enabled = !state.disable_sa;
+            state.cached_sa_enabled = enable_sa;
         }
         // else: reuse state.primary_orbit from cache
 
@@ -3462,6 +3473,7 @@ int main(int argc, char* argv[]) {
     bool disable_bla = false;     // Disable Bilinear Approximation
     bool disable_block = false;   // Disable block-level tile filling
     bool disable_cache = false;   // Disable orbit caching
+    std::string dump_iter_path;   // Path to dump iteration buffer (for testing)
 
     static struct option long_options[] = {
         {"pos",   required_argument, 0, 'p'},
@@ -3469,11 +3481,14 @@ int main(int argc, char* argv[]) {
         {"angle", required_argument, 0, 'a'},
         {"auto",  optional_argument, 0, 'A'},
         {"image", optional_argument, 0, 'I'},
+        {"width", required_argument, 0, 'W'},
+        {"height", required_argument, 0, 'H'},
         {"benchmark", no_argument,   0, 'B'},
         {"no-sa", no_argument,       0, 'S'},
         {"no-bla", no_argument,      0, 'L'},
         {"no-block", no_argument,    0, 'K'},
         {"no-cache", no_argument,    0, 'C'},
+        {"dump-iter", required_argument, 0, 'O'},
         {"debug", no_argument,       0, 'D'},
         {"exit-now", no_argument,    0, 'X'},
         {"help",  no_argument,       0, 'h'},
@@ -3587,6 +3602,15 @@ int main(int argc, char* argv[]) {
                 break;
             case 'C':
                 disable_cache = true;
+                break;
+            case 'O':
+                dump_iter_path = optarg;
+                break;
+            case 'W':
+                state.image_width = atoi(optarg);
+                break;
+            case 'H':
+                state.image_height = atoi(optarg);
                 break;
             case 'D':
                 debug_dd = true;
@@ -3709,6 +3733,42 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "SA skip: %d of %d iterations (%.1f%%)\n",
                     skip, state.max_iter, 100.0 * skip / state.max_iter);
         }
+        return 0;
+    }
+
+    // Dump iteration mode: compute one frame and dump iteration buffer to file
+    if (!dump_iter_path.empty()) {
+        // Set up dimensions: use explicit --width/--height, or image mode, or default
+        // If image_width/height were modified from defaults (640x400), use them
+        bool custom_size = (state.image_width != 640 || state.image_height != 400);
+        state.width = (state.iterm_image_mode || custom_size) ? state.image_width : 64;
+        state.height = (state.iterm_image_mode || custom_size) ? state.image_height : 40;
+        state.iterations.resize(state.width * state.height);
+
+        // Scale max_iter with zoom
+        int suggested_iter = 256 + (int)(log10(std::max(1.0, state.zoom)) * 50);
+        state.max_iter = std::min(4096, std::max(256, suggested_iter));
+
+        // Compute the frame
+        compute_mandelbrot_unified(state);
+
+        // Write iteration buffer to file (binary format: width, height, then doubles)
+        FILE* fp = fopen(dump_iter_path.c_str(), "wb");
+        if (!fp) {
+            fprintf(stderr, "Error: Cannot open %s for writing\n", dump_iter_path.c_str());
+            return 1;
+        }
+
+        // Write header: width, height, max_iter
+        int32_t header[3] = {state.width, state.height, state.max_iter};
+        fwrite(header, sizeof(int32_t), 3, fp);
+
+        // Write iteration values as doubles
+        fwrite(state.iterations.data(), sizeof(double), state.iterations.size(), fp);
+        fclose(fp);
+
+        fprintf(stderr, "Dumped %dx%d iterations to %s (zoom=%.2e, max_iter=%d)\n",
+                state.width, state.height, dump_iter_path.c_str(), state.zoom, state.max_iter);
         return 0;
     }
 

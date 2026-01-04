@@ -70,7 +70,13 @@ make native
 | `--auto [N]` | Auto exploration, or trajectory over N seconds |
 | `--image [WxH]` | iTerm2 image mode (e.g., `--image=800x600`) |
 | `--benchmark` | Compute one frame and print timing (no interactive mode) |
-| `--no-sa` | Disable Series Approximation (for comparison/debugging) |
+| `--no-sa` | Disable Series Approximation |
+| `--no-bla` | Disable Bilinear Approximation |
+| `--no-block` | Disable block-level tile filling |
+| `--no-cache` | Disable reference orbit caching |
+| `--width N` | Set render width (for --dump-iter) |
+| `--height N` | Set render height (for --dump-iter) |
+| `--dump-iter PATH` | Dump iteration buffer to file (for testing) |
 | `--help` | Show help message |
 
 ### Interactive Controls
@@ -112,6 +118,8 @@ The validity check ensures the approximation error stays below tolerance:
 |D_n|² * |δC|⁶ < ε² * |A_n|²
 ```
 
+**Automatic threshold**: SA is automatically disabled at zoom > 1e12 where the 4-term polynomial approximation loses precision. BLA continues to provide iteration skipping at any zoom level.
+
 ### Bilinear Approximation (BLA)
 
 BLA provides additional iteration skipping where SA is less effective (near minibrots). Unlike SA which approximates in terms of δC only, BLA is linear in both δz and δC:
@@ -135,6 +143,8 @@ Instead of computing each pixel individually, the renderer first attempts to fil
 3. Otherwise, fall back to per-pixel computation
 
 This provides significant speedup in uniform regions (interior of cardioid, exterior far from boundary).
+
+**Automatic threshold**: Block-level filling is automatically disabled at extreme zoom (pixel size < 1e-15) where corner interpolation can introduce visible artifacts.
 
 ### Reference Orbit Caching
 
@@ -164,6 +174,31 @@ When built with `-mavx2`, the explorer processes 4 pixels simultaneously using S
 ### iTerm2 Image Mode
 
 When running in iTerm2 (detected via `LC_TERMINAL` or `ITERM_SESSION_ID`), the explorer can render using iTerm2's inline image protocol. This provides much higher resolution output (default 640x400 pixels) compared to terminal character cells. The image is encoded as PPM and transmitted via base64.
+
+## Testing
+
+The project includes comprehensive tests for optimization correctness:
+
+```bash
+# Run all tests
+make test-all
+
+# Run specific test suites
+make test              # Perturbation vs direct DD comparison
+make test-sa           # Series Approximation polynomial evaluation
+make test-trajectory   # Animation frame interestingness
+make test-flags        # Optimization flag combinations (64x40)
+
+# Run flag tests at higher resolution
+./test_flags --highres   # 256x160
+./test_flags --fullres   # 640x400
+```
+
+The flag matrix tests verify that all optimization combinations produce correct results:
+- Compares optimized rendering against fully-disabled baseline
+- Tests 8 locations at various zoom levels (1e6 to 1e18)
+- Validates escape/bounded classification and smooth iteration values
+- Detects block-level tile artifacts
 
 ## Requirements
 
