@@ -245,7 +245,21 @@ struct ReferenceOrbit {
     std::vector<double> SA_D_norm;     // |D_n|² for 4-term validity checks
     bool sa_enabled = false;           // Whether SA was computed
 
-    ReferenceOrbit() : length(0), escape_iter(-1), sa_enabled(false) {}
+    // ═══════════════════════════════════════════════════════════════════════
+    // BILINEAR APPROXIMATION (BLA) COEFFICIENTS
+    // ═══════════════════════════════════════════════════════════════════════
+    // BLA: δz_{m+l} = A_l * δz_m + B_l * δc
+    // Works where SA fails (near minibrots) by being linear in both δz and δc
+    // Level-0 BLAs (1-iteration): A = 2*Z, B = 1
+    // Higher levels created by merging: A_{y∘x} = A_y*A_x, B_{y∘x} = A_y*B_x + B_y
+    std::vector<double> BLA_Ar, BLA_Ai;  // A coefficient (complex)
+    std::vector<double> BLA_Br, BLA_Bi;  // B coefficient (complex)
+    std::vector<double> BLA_r;           // Validity radius
+    int bla_levels = 0;                  // Number of BLA levels (log2 of orbit length)
+    std::vector<int> bla_level_start;    // Start index of each level in BLA arrays
+    bool bla_enabled = false;            // Whether BLA was computed
+
+    ReferenceOrbit() : length(0), escape_iter(-1), sa_enabled(false), bla_levels(0), bla_enabled(false) {}
 
     void clear() {
         Zr_hi.clear();
@@ -261,9 +275,15 @@ struct ReferenceOrbit {
         SA_Dr.clear(); SA_Di.clear();
         SA_A_norm.clear();
         SA_D_norm.clear();
+        BLA_Ar.clear(); BLA_Ai.clear();
+        BLA_Br.clear(); BLA_Bi.clear();
+        BLA_r.clear();
+        bla_level_start.clear();
         length = 0;
         escape_iter = -1;
         sa_enabled = false;
+        bla_levels = 0;
+        bla_enabled = false;
     }
 };
 
@@ -439,6 +459,220 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
     orbit.escape_iter = -1;  // Didn't escape
     orbit.length = max_iter + 1;
     orbit.sa_enabled = enable_sa;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BILINEAR APPROXIMATION (BLA) COMPUTATION
+// ═══════════════════════════════════════════════════════════════════════════
+// BLA provides iteration skipping where SA fails (near minibrots/critical points)
+// Key equation: δz_{m+l} = A_l * δz_m + B_l * δc  (linear in both δz and δc)
+//
+// For 1-iteration BLA at iteration m:
+//   A_1 = 2*Z_m
+//   B_1 = 1
+//   r_1 = ε * |Z_{m+1}| / 2  (validity radius)
+//
+// Merging BLAs x and y (x precedes y):
+//   A_{y∘x} = A_y * A_x
+//   B_{y∘x} = A_y * B_x + B_y
+//   r_{y∘x} = min(r_x, max(0, (r_y - |B_x|*max_dC) / |A_x|))
+
+constexpr double BLA_EPSILON = 1e-10;  // Precision threshold for validity
+constexpr double BLA_SAFETY = 0.5;     // Safety factor for validity radius
+
+inline void compute_bla_table(ReferenceOrbit& orbit, double max_dC_norm) {
+    if (orbit.length < 2) {
+        orbit.bla_enabled = false;
+        return;
+    }
+
+    int M = orbit.length - 1;  // Number of iterations (excluding initial Z=0)
+
+    // Calculate number of levels: log2(M) rounded up
+    int num_levels = 0;
+    int temp = M;
+    while (temp > 0) {
+        num_levels++;
+        temp >>= 1;
+    }
+    orbit.bla_levels = num_levels;
+
+    // Total BLA entries: M + M/2 + M/4 + ... ≈ 2M
+    int total_entries = 0;
+    orbit.bla_level_start.resize(num_levels + 1);
+    int level_size = M;
+    for (int level = 0; level < num_levels; level++) {
+        orbit.bla_level_start[level] = total_entries;
+        total_entries += level_size;
+        level_size = (level_size + 1) / 2;  // Round up for merging
+    }
+    orbit.bla_level_start[num_levels] = total_entries;
+
+    // Allocate BLA arrays
+    orbit.BLA_Ar.resize(total_entries);
+    orbit.BLA_Ai.resize(total_entries);
+    orbit.BLA_Br.resize(total_entries);
+    orbit.BLA_Bi.resize(total_entries);
+    orbit.BLA_r.resize(total_entries);
+
+    double max_dC = std::sqrt(max_dC_norm);
+
+    // Level 0: 1-iteration BLAs
+    // A_1 = 2*Z, B_1 = 1, r_1 = ε*|Z_{next}| * safety
+    for (int m = 0; m < M; m++) {
+        int idx = orbit.bla_level_start[0] + m;
+        double Zr = orbit.Zr_sum[m];
+        double Zi = orbit.Zi_sum[m];
+
+        // A = 2*Z
+        orbit.BLA_Ar[idx] = 2.0 * Zr;
+        orbit.BLA_Ai[idx] = 2.0 * Zi;
+
+        // B = 1 (complex)
+        orbit.BLA_Br[idx] = 1.0;
+        orbit.BLA_Bi[idx] = 0.0;
+
+        // Validity radius: r = ε * |Z_{m+1}| * safety
+        // The approximation δz_{n+1} = 2*Z_n*δz_n + δc is valid when δz² << 2*Z*δz
+        // i.e., |δz| << |Z|, specifically |δz| < ε*|Z|
+        double Z_next_norm = (m + 1 < orbit.length) ? orbit.Z_norm[m + 1] : orbit.Z_norm[m];
+        double Z_next_abs = std::sqrt(Z_next_norm);
+        orbit.BLA_r[idx] = BLA_EPSILON * Z_next_abs * BLA_SAFETY;
+    }
+
+    // Higher levels: merge pairs of BLAs
+    // A_{y∘x} = A_y * A_x, B_{y∘x} = A_y * B_x + B_y
+    // r_{y∘x} = min(r_x, max(0, (r_y - |B_x|*max_dC) / |A_x|))
+    for (int level = 1; level < num_levels; level++) {
+        int prev_start = orbit.bla_level_start[level - 1];
+        int prev_count = orbit.bla_level_start[level] - prev_start;
+        int curr_start = orbit.bla_level_start[level];
+
+        // Number of merged BLAs at this level
+        int curr_count = (prev_count + 1) / 2;
+
+        for (int i = 0; i < curr_count; i++) {
+            int idx_x = prev_start + 2 * i;       // First BLA in pair
+            int idx_y = prev_start + 2 * i + 1;   // Second BLA in pair
+            int idx_merged = curr_start + i;
+
+            // Handle odd case: if no second BLA, just copy first
+            if (2 * i + 1 >= prev_count) {
+                orbit.BLA_Ar[idx_merged] = orbit.BLA_Ar[idx_x];
+                orbit.BLA_Ai[idx_merged] = orbit.BLA_Ai[idx_x];
+                orbit.BLA_Br[idx_merged] = orbit.BLA_Br[idx_x];
+                orbit.BLA_Bi[idx_merged] = orbit.BLA_Bi[idx_x];
+                orbit.BLA_r[idx_merged] = orbit.BLA_r[idx_x];
+                continue;
+            }
+
+            double Ax_r = orbit.BLA_Ar[idx_x], Ax_i = orbit.BLA_Ai[idx_x];
+            double Bx_r = orbit.BLA_Br[idx_x], Bx_i = orbit.BLA_Bi[idx_x];
+            double rx = orbit.BLA_r[idx_x];
+
+            double Ay_r = orbit.BLA_Ar[idx_y], Ay_i = orbit.BLA_Ai[idx_y];
+            double By_r = orbit.BLA_Br[idx_y], By_i = orbit.BLA_Bi[idx_y];
+            double ry = orbit.BLA_r[idx_y];
+
+            // A_{merged} = A_y * A_x (complex multiplication)
+            double Am_r = Ay_r * Ax_r - Ay_i * Ax_i;
+            double Am_i = Ay_r * Ax_i + Ay_i * Ax_r;
+
+            // B_{merged} = A_y * B_x + B_y
+            double AyBx_r = Ay_r * Bx_r - Ay_i * Bx_i;
+            double AyBx_i = Ay_r * Bx_i + Ay_i * Bx_r;
+            double Bm_r = AyBx_r + By_r;
+            double Bm_i = AyBx_i + By_i;
+
+            // r_{merged} = min(r_x, max(0, (r_y - |B_x|*max_dC) / |A_x|))
+            double Bx_abs = std::sqrt(Bx_r * Bx_r + Bx_i * Bx_i);
+            double Ax_abs = std::sqrt(Ax_r * Ax_r + Ax_i * Ax_i);
+            double rm = rx;
+            if (Ax_abs > 0) {
+                double r_from_y = std::max(0.0, (ry - Bx_abs * max_dC) / Ax_abs);
+                rm = std::min(rx, r_from_y);
+            }
+
+            orbit.BLA_Ar[idx_merged] = Am_r;
+            orbit.BLA_Ai[idx_merged] = Am_i;
+            orbit.BLA_Br[idx_merged] = Bm_r;
+            orbit.BLA_Bi[idx_merged] = Bm_i;
+            orbit.BLA_r[idx_merged] = rm;
+        }
+    }
+
+    orbit.bla_enabled = true;
+}
+
+// Find maximum iteration skip using BLA, returns skip amount and updates δz
+// Returns 0 if no valid BLA found, otherwise returns the number of iterations skipped
+inline int bla_find_skip(const ReferenceOrbit& orbit,
+                         int start_iter,
+                         double dzr, double dzi,
+                         double dCr, double dCi,
+                         double& dzr_out, double& dzi_out) {
+    if (!orbit.bla_enabled || orbit.bla_levels == 0 || start_iter >= orbit.length - 1) {
+        dzr_out = dzr;
+        dzi_out = dzi;
+        return 0;
+    }
+
+    double dz_abs = std::sqrt(dzr * dzr + dzi * dzi);
+
+    // Start from highest level BLA and work down to find valid skip
+    int total_skip = 0;
+    double curr_dzr = dzr, curr_dzi = dzi;
+    int curr_iter = start_iter;
+
+    // Try to apply BLAs greedily from highest level down
+    for (int level = orbit.bla_levels - 1; level >= 0; level--) {
+        int level_start = orbit.bla_level_start[level];
+        int level_end = orbit.bla_level_start[level + 1];
+        int iters_per_bla = 1 << level;  // 2^level iterations per BLA at this level
+
+        // Find which BLA at this level applies to curr_iter
+        // The m-th BLA at level 0 corresponds to iteration m
+        // The m-th BLA at level l corresponds to iterations m*2^l to (m+1)*2^l - 1
+        int bla_idx_in_level = curr_iter >> level;  // curr_iter / 2^level
+        int bla_idx = level_start + bla_idx_in_level;
+
+        if (bla_idx >= level_end) continue;
+
+        // Check if we'd exceed orbit length
+        if (curr_iter + iters_per_bla > orbit.length - 1) continue;
+
+        // Check validity: |δz| < r
+        double r = orbit.BLA_r[bla_idx];
+        double curr_dz_abs = std::sqrt(curr_dzr * curr_dzr + curr_dzi * curr_dzi);
+
+        if (curr_dz_abs < r) {
+            // BLA is valid, apply it: δz_new = A * δz + B * δc
+            double Ar = orbit.BLA_Ar[bla_idx];
+            double Ai = orbit.BLA_Ai[bla_idx];
+            double Br = orbit.BLA_Br[bla_idx];
+            double Bi = orbit.BLA_Bi[bla_idx];
+
+            // A * δz
+            double Adz_r = Ar * curr_dzr - Ai * curr_dzi;
+            double Adz_i = Ar * curr_dzi + Ai * curr_dzr;
+
+            // B * δc
+            double Bdc_r = Br * dCr - Bi * dCi;
+            double Bdc_i = Br * dCi + Bi * dCr;
+
+            curr_dzr = Adz_r + Bdc_r;
+            curr_dzi = Adz_i + Bdc_i;
+            curr_iter += iters_per_bla;
+            total_skip += iters_per_bla;
+
+            // After applying, try again at same level (might be able to apply more)
+            level++;  // Will be decremented by loop, so stays at same level
+        }
+    }
+
+    dzr_out = curr_dzr;
+    dzi_out = curr_dzi;
+    return total_skip;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1065,6 +1299,33 @@ void compute_perturbation_scalar(MandelbrotState& state,
             }
 
             while (!escaped && iter < state.max_iter && iter < max_ref_iter) {
+                // ═══════════════════════════════════════════════════════════════
+                // BLA: Try to skip multiple iterations using bilinear approximation
+                // ═══════════════════════════════════════════════════════════════
+                if (orbit.bla_enabled) {
+                    double bla_dzr, bla_dzi;
+                    int bla_skip = bla_find_skip(orbit, iter, dzr, dzi, dCr, dCi, bla_dzr, bla_dzi);
+                    if (bla_skip > 0 && iter + bla_skip <= max_ref_iter) {
+                        dzr = bla_dzr;
+                        dzi = bla_dzi;
+                        iter += bla_skip;
+
+                        // Check escape after BLA skip
+                        if (iter <= max_ref_iter) {
+                            double full_zr = orbit.Zr_sum[iter] + dzr;
+                            double full_zi = orbit.Zi_sum[iter] + dzi;
+                            double mag2 = full_zr * full_zr + full_zi * full_zi;
+                            if (mag2 > 4.0) {
+                                escaped = true;
+                                final_zr = full_zr;
+                                final_zi = full_zi;
+                                break;
+                            }
+                        }
+                        continue;  // Try BLA again
+                    }
+                }
+
                 // Use precomputed sums for full DD precision
                 double Zr = orbit.Zr_sum[iter];
                 double Zi = orbit.Zi_sum[iter];
@@ -1785,6 +2046,15 @@ void handle_glitches(MandelbrotState& state) {
         DD new_center_y = pixel_to_dd_y(gx, gy, state);
         compute_reference_orbit(new_orbit, new_center_x, new_center_y, state.max_iter, !state.disable_sa);
 
+        // Compute BLA table for the new reference
+        if (!state.disable_sa) {
+            double pixel_size = 3.0 / state.zoom / state.width;
+            double half_w = state.width / 2.0 * pixel_size;
+            double half_h = state.height / 2.0 * pixel_size;
+            double max_dC_norm = half_w * half_w + half_h * half_h;
+            compute_bla_table(new_orbit, max_dC_norm);
+        }
+
         // Recompute only glitched pixels with new reference
         double aspect = (double)state.width / (state.height * 2.0);
         double scale = 3.0 / state.zoom;
@@ -1954,6 +2224,17 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
                                    state.center_x_dd, state.center_y_dd,
                                    effective_max_iter,
                                    !state.disable_sa);
+
+            // Compute BLA table if SA is enabled
+            // max_dC_norm is the maximum |δC|² for any pixel on screen
+            // Half-diagonal of screen in complex plane
+            if (!state.disable_sa) {
+                double pixel_size = 3.0 / state.zoom / state.width;
+                double half_w = state.width / 2.0 * pixel_size;
+                double half_h = state.height / 2.0 * pixel_size;
+                double max_dC_norm = half_w * half_w + half_h * half_h;
+                compute_bla_table(state.primary_orbit, max_dC_norm);
+            }
 
             // Update cache metadata
             state.orbit_cache_valid = true;
