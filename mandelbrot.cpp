@@ -1009,7 +1009,10 @@ struct MandelbrotState {
     std::vector<uint8_t> image_buffer;  // RGB buffer for image output
 
     // Series Approximation control
-    bool disable_sa = false;  // Disable SA for benchmarking
+    bool disable_sa = false;    // Disable SA for benchmarking
+    bool disable_bla = false;   // Disable BLA for debugging
+    bool disable_block = false; // Disable block-level tile filling for debugging
+    bool disable_cache = false; // Disable orbit caching for debugging
 
     // Reference orbit cache - avoid recomputing when center hasn't changed
     bool orbit_cache_valid = false;
@@ -1302,7 +1305,7 @@ void compute_perturbation_scalar(MandelbrotState& state,
                 // ═══════════════════════════════════════════════════════════════
                 // BLA: Try to skip multiple iterations using bilinear approximation
                 // ═══════════════════════════════════════════════════════════════
-                if (orbit.bla_enabled) {
+                if (orbit.bla_enabled && !state.disable_bla) {
                     double bla_dzr, bla_dzi;
                     int bla_skip = bla_find_skip(orbit, iter, dzr, dzi, dCr, dCi, bla_dzr, bla_dzi);
                     if (bla_skip > 0 && iter + bla_skip <= max_ref_iter) {
@@ -1826,13 +1829,16 @@ void compute_perturbation_threaded(MandelbrotState& state, const ReferenceOrbit&
 
     // Phase 1: Block-level SA pass - try to fill uniform tiles
     // This is done single-threaded for simplicity (tiles are fast to evaluate)
+    // Skip if block-level optimization is disabled
     int tiles_filled = 0;
     int tiles_total = 0;
-    for (int ty = 0; ty < state.height; ty += TILE_SIZE) {
-        for (int tx = 0; tx < state.width; tx += TILE_SIZE) {
-            tiles_total++;
-            if (try_fill_tile(state, orbit, tx, ty, TILE_SIZE, TILE_SIZE)) {
-                tiles_filled++;
+    if (!state.disable_block) {
+        for (int ty = 0; ty < state.height; ty += TILE_SIZE) {
+            for (int tx = 0; tx < state.width; tx += TILE_SIZE) {
+                tiles_total++;
+                if (try_fill_tile(state, orbit, tx, ty, TILE_SIZE, TILE_SIZE)) {
+                    tiles_filled++;
+                }
             }
         }
     }
@@ -2207,7 +2213,9 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
 
         // Check if we can reuse the cached reference orbit
         // Cache is valid if center, max_iter, and SA settings match
-        bool cache_hit = state.orbit_cache_valid &&
+        // Skip cache if disable_cache is set (for debugging)
+        bool cache_hit = !state.disable_cache &&
+                         state.orbit_cache_valid &&
                          state.cached_center_x.hi == state.center_x_dd.hi &&
                          state.cached_center_x.lo == state.center_x_dd.lo &&
                          state.cached_center_y.hi == state.center_y_dd.hi &&
@@ -3403,6 +3411,9 @@ void print_usage(const char* prog) {
     printf("                     Optional resolution, e.g., --image=800x600 (default 640x400)\n");
     printf("  --benchmark        Compute one frame and print timing (no interactive mode)\n");
     printf("  --no-sa            Disable Series Approximation (for benchmarking)\n");
+    printf("  --no-bla           Disable Bilinear Approximation (for debugging)\n");
+    printf("  --no-block         Disable block-level tile filling (for debugging)\n");
+    printf("  --no-cache         Disable reference orbit caching (for debugging)\n");
     printf("  --help             Show this help message\n");
     printf("\nDebug options:\n");
     printf("  --debug            Print DD precision values to stderr at parse and exit\n");
@@ -3448,6 +3459,9 @@ int main(int argc, char* argv[]) {
     bool exit_now = false;  // Exit immediately after parsing (for testing)
     bool benchmark_mode = false;  // Compute one frame and print timing
     bool disable_sa = false;      // Disable Series Approximation
+    bool disable_bla = false;     // Disable Bilinear Approximation
+    bool disable_block = false;   // Disable block-level tile filling
+    bool disable_cache = false;   // Disable orbit caching
 
     static struct option long_options[] = {
         {"pos",   required_argument, 0, 'p'},
@@ -3457,6 +3471,9 @@ int main(int argc, char* argv[]) {
         {"image", optional_argument, 0, 'I'},
         {"benchmark", no_argument,   0, 'B'},
         {"no-sa", no_argument,       0, 'S'},
+        {"no-bla", no_argument,      0, 'L'},
+        {"no-block", no_argument,    0, 'K'},
+        {"no-cache", no_argument,    0, 'C'},
         {"debug", no_argument,       0, 'D'},
         {"exit-now", no_argument,    0, 'X'},
         {"help",  no_argument,       0, 'h'},
@@ -3562,6 +3579,15 @@ int main(int argc, char* argv[]) {
             case 'S':
                 disable_sa = true;
                 break;
+            case 'L':
+                disable_bla = true;
+                break;
+            case 'K':
+                disable_block = true;
+                break;
+            case 'C':
+                disable_cache = true;
+                break;
             case 'D':
                 debug_dd = true;
                 break;
@@ -3578,8 +3604,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Apply disable_sa to state
+    // Apply optimization disable flags to state
     state.disable_sa = disable_sa;
+    state.disable_bla = disable_bla;
+    state.disable_block = disable_block;
+    state.disable_cache = disable_cache;
 
     // Debug: Print parsed DD values
     if (debug_dd && has_target_pos) {
