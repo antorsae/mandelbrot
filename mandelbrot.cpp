@@ -1316,14 +1316,14 @@ void compute_perturbation_avx2(MandelbrotState& state,
             // Extract and store results
             double iter_arr[4], zr_arr[4], zi_arr[4];
             double escaped_arr[4], glitched_arr[4];
-            double dzr_arr[4], dzi_arr[4];
+            double dzr_out[4], dzi_out[4];
             _mm256_storeu_pd(iter_arr, iter);
             _mm256_storeu_pd(zr_arr, escaped_zr);
             _mm256_storeu_pd(zi_arr, escaped_zi);
             _mm256_storeu_pd(escaped_arr, has_escaped);
             _mm256_storeu_pd(glitched_arr, is_glitched);
-            _mm256_storeu_pd(dzr_arr, dzr);
-            _mm256_storeu_pd(dzi_arr, dzi);
+            _mm256_storeu_pd(dzr_out, dzr);
+            _mm256_storeu_pd(dzi_out, dzi);
 
             for (int i = 0; i < 4 && x + i < state.width; i++) {
                 int idx = y * state.width + x + i;
