@@ -240,7 +240,9 @@ struct ReferenceOrbit {
     std::vector<double> SA_Ar, SA_Ai;  // A coefficient (linear term)
     std::vector<double> SA_Br, SA_Bi;  // B coefficient (quadratic term)
     std::vector<double> SA_Cr, SA_Ci;  // C coefficient (cubic term)
+    std::vector<double> SA_Dr, SA_Di;  // D coefficient (quartic term)
     std::vector<double> SA_A_norm;     // |A_n|² for validity checks
+    std::vector<double> SA_D_norm;     // |D_n|² for 4-term validity checks
     bool sa_enabled = false;           // Whether SA was computed
 
     ReferenceOrbit() : length(0), escape_iter(-1), sa_enabled(false) {}
@@ -256,7 +258,9 @@ struct ReferenceOrbit {
         SA_Ar.clear(); SA_Ai.clear();
         SA_Br.clear(); SA_Bi.clear();
         SA_Cr.clear(); SA_Ci.clear();
+        SA_Dr.clear(); SA_Di.clear();
         SA_A_norm.clear();
+        SA_D_norm.clear();
         length = 0;
         escape_iter = -1;
         sa_enabled = false;
@@ -304,7 +308,10 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
         orbit.SA_Bi.reserve(max_iter + 1);
         orbit.SA_Cr.reserve(max_iter + 1);
         orbit.SA_Ci.reserve(max_iter + 1);
+        orbit.SA_Dr.reserve(max_iter + 1);
+        orbit.SA_Di.reserve(max_iter + 1);
         orbit.SA_A_norm.reserve(max_iter + 1);
+        orbit.SA_D_norm.reserve(max_iter + 1);
     }
 
     // Initial Z = 0
@@ -316,7 +323,7 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
     orbit.Zi_sum.push_back(0.0);
     orbit.Z_norm.push_back(0.0);
 
-    // Initial SA coefficients: A_0 = B_0 = C_0 = 0 (since δZ_0 = 0)
+    // Initial SA coefficients: A_0 = B_0 = C_0 = D_0 = 0 (since δZ_0 = 0)
     if (enable_sa) {
         orbit.SA_Ar.push_back(0.0);
         orbit.SA_Ai.push_back(0.0);
@@ -324,17 +331,21 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
         orbit.SA_Bi.push_back(0.0);
         orbit.SA_Cr.push_back(0.0);
         orbit.SA_Ci.push_back(0.0);
+        orbit.SA_Dr.push_back(0.0);
+        orbit.SA_Di.push_back(0.0);
         orbit.SA_A_norm.push_back(0.0);
+        orbit.SA_D_norm.push_back(0.0);
     }
 
     DDComplex C(center_x, center_y);
     DDComplex Z(0.0, 0.0);
 
     // SA coefficients (complex numbers) - only used if enable_sa
-    // δZ_n = A_n*δC + B_n*δC² + C_n*δC³
+    // δZ_n = A_n*δC + B_n*δC² + C_n*δC³ + D_n*δC⁴
     double Ar = 0.0, Ai = 0.0;  // A_n
     double Br = 0.0, Bi = 0.0;  // B_n
     double Cr = 0.0, Ci = 0.0;  // C_n
+    double Dr = 0.0, Di = 0.0;  // D_n
 
     for (int n = 0; n < max_iter; n++) {
         Z = Z.square() + C;
@@ -360,12 +371,13 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
         // ═══════════════════════════════════════════════════════════════════
         if (enable_sa) {
             // Given: δZ_{n+1} = 2*Z_n*δZ_n + δZ_n² + δC
-            // With: δZ_n = A_n*δC + B_n*δC² + C_n*δC³ + ...
+            // With: δZ_n = A_n*δC + B_n*δC² + C_n*δC³ + D_n*δC⁴ + ...
             //
             // Recurrence relations (complex multiplication):
             //   A_{n+1} = 2*Z_n*A_n + 1
             //   B_{n+1} = 2*Z_n*B_n + A_n²
             //   C_{n+1} = 2*Z_n*C_n + 2*A_n*B_n
+            //   D_{n+1} = 2*Z_n*D_n + (2*A_n*C_n + B_n²)
 
             // Use Z from previous iteration (Z_n before the square+C above)
             double Zr_prev = (n == 0) ? 0.0 : orbit.Zr_sum[n];
@@ -387,9 +399,20 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
             double new_Cr = 2.0 * (Zr_prev * Cr - Zi_prev * Ci) + 2.0 * ABr;
             double new_Ci = 2.0 * (Zr_prev * Ci + Zi_prev * Cr) + 2.0 * ABi;
 
+            // D_{n+1} = 2*Z_n*D_n + (2*A_n*C_n + B_n²)
+            // A*C = (Ar*Cr - Ai*Ci) + (Ar*Ci + Ai*Cr)*i
+            double ACr = Ar * Cr - Ai * Ci;
+            double ACi = Ar * Ci + Ai * Cr;
+            // B² = (Br² - Bi²) + (2*Br*Bi)*i
+            double B2r = Br * Br - Bi * Bi;
+            double B2i = 2.0 * Br * Bi;
+            double new_Dr = 2.0 * (Zr_prev * Dr - Zi_prev * Di) + 2.0 * ACr + B2r;
+            double new_Di = 2.0 * (Zr_prev * Di + Zi_prev * Dr) + 2.0 * ACi + B2i;
+
             Ar = new_Ar; Ai = new_Ai;
             Br = new_Br; Bi = new_Bi;
             Cr = new_Cr; Ci = new_Ci;
+            Dr = new_Dr; Di = new_Di;
 
             // Store coefficients
             orbit.SA_Ar.push_back(Ar);
@@ -398,7 +421,10 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
             orbit.SA_Bi.push_back(Bi);
             orbit.SA_Cr.push_back(Cr);
             orbit.SA_Ci.push_back(Ci);
+            orbit.SA_Dr.push_back(Dr);
+            orbit.SA_Di.push_back(Di);
             orbit.SA_A_norm.push_back(Ar * Ar + Ai * Ai);
+            orbit.SA_D_norm.push_back(Dr * Dr + Di * Di);
         }
 
         // Use larger escape radius for reference (extends orbit length)
@@ -420,13 +446,13 @@ inline void compute_reference_orbit(ReferenceOrbit& orbit,
 // ═══════════════════════════════════════════════════════════════════════════
 
 // SA validity criterion: truncation error < tolerance * approximation value
-// We use 3 terms: δZ ≈ A*δC + B*δC² + C*δC³
-// Error is dominated by C*δC³ term when truncating to 2 terms (A*δC + B*δC²)
-// For 3-term approximation, we check the cubic term against the linear:
-//   |C*δC³| < ε * |A*δC|
-//   |C|*|δC|² < ε * |A|
+// We use 4 terms: δZ ≈ A*δC + B*δC² + C*δC³ + D*δC⁴
+// Error is dominated by E*δC⁵ (the next uncomputed term)
+// Since we don't compute E, we use D as proxy for validity:
+//   |D*δC⁴| < ε * |A*δC|
+//   |D|*|δC|³ < ε * |A|
 // Squaring both sides for numerical convenience:
-//   |C|²*|δC|⁴ < ε²*|A|²
+//   |D|²*|δC|⁶ < ε²*|A|²
 constexpr double SA_TOLERANCE = 0.001;  // Conservative tolerance for accuracy
 
 // Find maximum iteration where SA approximation is valid for given δC
@@ -456,16 +482,17 @@ inline int sa_find_skip_iteration(const ReferenceOrbit& orbit,
     int best_skip = 0;
 
     // Lambda to check validity at iteration n
+    // For 4-term SA: |D|² * |δC|⁶ < ε² * |A|²
     auto is_valid = [&](int n) -> bool {
         if (n < 1 || n > max_check) return false;
-        double Cr = orbit.SA_Cr[n];
-        double Ci = orbit.SA_Ci[n];
-        double C_norm = Cr * Cr + Ci * Ci;
+        double D_norm = orbit.SA_D_norm[n];
         double A_norm = orbit.SA_A_norm[n];
-        if (!std::isfinite(C_norm) || !std::isfinite(A_norm) || A_norm == 0.0)
+        if (!std::isfinite(D_norm) || !std::isfinite(A_norm) || A_norm == 0.0)
             return false;
-        // Validity check: |C|² * |δC|⁴ < ε² * |A|²
-        double lhs = C_norm * dC_norm * dC_norm;
+        // Validity check: |D|² * |δC|⁶ < ε² * |A|²
+        // |δC|⁶ = (|δC|²)³ = dC_norm³
+        double dC_norm_cubed = dC_norm * dC_norm * dC_norm;
+        double lhs = D_norm * dC_norm_cubed;
         double rhs = SA_TOLERANCE * SA_TOLERANCE * A_norm;
         return lhs < rhs;
     };
@@ -499,6 +526,8 @@ inline int sa_find_skip_iteration(const ReferenceOrbit& orbit,
         double Bi = orbit.SA_Bi[best_skip];
         double Cr = orbit.SA_Cr[best_skip];
         double Ci = orbit.SA_Ci[best_skip];
+        double Dr = orbit.SA_Dr[best_skip];
+        double Di = orbit.SA_Di[best_skip];
 
         // Compute δC² = (dCr + i*dCi)²
         double dC2r = dCr * dCr - dCi * dCi;
@@ -508,7 +537,11 @@ inline int sa_find_skip_iteration(const ReferenceOrbit& orbit,
         double dC3r = dC2r * dCr - dC2i * dCi;
         double dC3i = dC2r * dCi + dC2i * dCr;
 
-        // δZ = A*δC + B*δC² + C*δC³
+        // Compute δC⁴ = δC³ * δC
+        double dC4r = dC3r * dCr - dC3i * dCi;
+        double dC4i = dC3r * dCi + dC3i * dCr;
+
+        // δZ = A*δC + B*δC² + C*δC³ + D*δC⁴
         // A*δC
         double term1r = Ar * dCr - Ai * dCi;
         double term1i = Ar * dCi + Ai * dCr;
@@ -521,8 +554,12 @@ inline int sa_find_skip_iteration(const ReferenceOrbit& orbit,
         double term3r = Cr * dC3r - Ci * dC3i;
         double term3i = Cr * dC3i + Ci * dC3r;
 
-        dzr_out = term1r + term2r + term3r;
-        dzi_out = term1i + term2i + term3i;
+        // D*δC⁴
+        double term4r = Dr * dC4r - Di * dC4i;
+        double term4i = Dr * dC4i + Di * dC4r;
+
+        dzr_out = term1r + term2r + term3r + term4r;
+        dzi_out = term1i + term2i + term3i + term4i;
 
         // Guard against non-finite results from coefficient overflow
         if (!std::isfinite(dzr_out) || !std::isfinite(dzi_out)) {
