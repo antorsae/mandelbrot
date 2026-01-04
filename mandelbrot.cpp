@@ -1417,11 +1417,166 @@ void compute_perturbation_avx2(MandelbrotState& state,
 }
 #endif
 
-// Threaded perturbation computation
+// ═══════════════════════════════════════════════════════════════════════════
+// BLOCK-LEVEL SA EVALUATION
+// ═══════════════════════════════════════════════════════════════════════════
+// Evaluate SA at tile corners. If all corners agree (escape/bounded, similar iter),
+// fill the entire tile without per-pixel computation. Otherwise mark for per-pixel.
+
+constexpr int TILE_SIZE = 16;
+constexpr double TILE_ITER_TOLERANCE = 2.0;  // Max iteration variance within tile
+
+// Compute a single pixel's result using SA + perturbation
+// Returns: iteration count (smooth), or -1.0 for bounded, -2.0 for glitch
+inline double compute_single_pixel(const MandelbrotState& state, const ReferenceOrbit& orbit,
+                                   int x, int y) {
+    double aspect = (double)state.width / (state.height * 2.0);
+    double scale = 3.0 / state.zoom;
+    double cos_a = cos(state.angle);
+    double sin_a = sin(state.angle);
+    double pan_x = state.pan_offset_x.hi + state.pan_offset_x.lo;
+    double pan_y = state.pan_offset_y.hi + state.pan_offset_y.lo;
+
+    double dx = (x - state.width / 2.0) / state.width * scale * aspect;
+    double dy = (y - state.height / 2.0) / state.height * scale;
+
+    double total_x = dx + pan_x;
+    double total_y = dy + pan_y;
+    double dCr = total_x * cos_a - total_y * sin_a;
+    double dCi = total_x * sin_a + total_y * cos_a;
+
+    double dzr = 0.0, dzi = 0.0;
+    int iter = sa_find_skip_iteration(orbit, dCr, dCi, dzr, dzi, state.max_iter);
+
+    bool escaped = false;
+    double final_zr = 0, final_zi = 0;
+    int max_ref_iter = orbit.length - 1;
+
+    // Check if SA already found escape
+    if (iter > 0) {
+        double full_zr = orbit.Zr_sum[iter] + dzr;
+        double full_zi = orbit.Zi_sum[iter] + dzi;
+        double mag2 = full_zr * full_zr + full_zi * full_zi;
+        if (mag2 > 4.0) {
+            escaped = true;
+            final_zr = full_zr;
+            final_zi = full_zi;
+        }
+    }
+
+    // Quick perturbation loop (simplified for corner sampling)
+    while (!escaped && iter < state.max_iter && iter < max_ref_iter) {
+        double Zr = orbit.Zr_sum[iter];
+        double Zi = orbit.Zi_sum[iter];
+
+        double temp_r = 2.0 * Zr + dzr;
+        double temp_i = 2.0 * Zi + dzi;
+
+        double new_dzr = temp_r * dzr - temp_i * dzi + dCr;
+        double new_dzi = temp_r * dzi + temp_i * dzr + dCi;
+
+        dzr = new_dzr;
+        dzi = new_dzi;
+        iter++;
+
+        double full_zr = Zr + dzr;
+        double full_zi = Zi + dzi;
+        double mag2 = full_zr * full_zr + full_zi * full_zi;
+
+        if (mag2 > 4.0) {
+            escaped = true;
+            final_zr = full_zr;
+            final_zi = full_zi;
+            break;
+        }
+    }
+
+    if (escaped) {
+        return smooth_iter(final_zr, final_zi, iter, state.max_iter);
+    }
+    return -1.0;  // Bounded
+}
+
+// Try to fill a tile using block-level SA
+// Returns true if tile was filled, false if per-pixel needed
+bool try_fill_tile(MandelbrotState& state, const ReferenceOrbit& orbit,
+                   int tile_x, int tile_y, int tile_w, int tile_h) {
+    // Clamp to image bounds
+    int x0 = tile_x;
+    int y0 = tile_y;
+    int x1 = std::min(tile_x + tile_w - 1, state.width - 1);
+    int y1 = std::min(tile_y + tile_h - 1, state.height - 1);
+
+    if (x0 >= state.width || y0 >= state.height) return true;  // Out of bounds
+
+    // Sample corners
+    double corners[4];
+    corners[0] = compute_single_pixel(state, orbit, x0, y0);  // Top-left
+    corners[1] = compute_single_pixel(state, orbit, x1, y0);  // Top-right
+    corners[2] = compute_single_pixel(state, orbit, x0, y1);  // Bottom-left
+    corners[3] = compute_single_pixel(state, orbit, x1, y1);  // Bottom-right
+
+    // Check if all corners are bounded
+    bool all_bounded = (corners[0] == -1.0 && corners[1] == -1.0 &&
+                        corners[2] == -1.0 && corners[3] == -1.0);
+
+    // Check if all corners escaped with similar iterations
+    bool all_escaped = (corners[0] >= 0 && corners[1] >= 0 &&
+                        corners[2] >= 0 && corners[3] >= 0);
+
+    if (all_bounded) {
+        // Fill tile as bounded
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                state.iterations[y * state.width + x] = -1.0;
+            }
+        }
+        return true;
+    }
+
+    if (all_escaped) {
+        // Check iteration variance
+        double min_iter = std::min({corners[0], corners[1], corners[2], corners[3]});
+        double max_iter = std::max({corners[0], corners[1], corners[2], corners[3]});
+
+        if (max_iter - min_iter <= TILE_ITER_TOLERANCE) {
+            // Fill tile with average iteration
+            double avg_iter = (corners[0] + corners[1] + corners[2] + corners[3]) / 4.0;
+            for (int y = y0; y <= y1; y++) {
+                for (int x = x0; x <= x1; x++) {
+                    state.iterations[y * state.width + x] = avg_iter;
+                }
+            }
+            return true;
+        }
+    }
+
+    return false;  // Need per-pixel computation
+}
+
+// Threaded perturbation computation with block-level SA optimization
 void compute_perturbation_threaded(MandelbrotState& state, const ReferenceOrbit& orbit) {
     int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
 
+    // Initialize all pixels to a special "needs computation" marker
+    constexpr double NEEDS_COMPUTE = -3.0;
+    std::fill(state.iterations.begin(), state.iterations.end(), NEEDS_COMPUTE);
+
+    // Phase 1: Block-level SA pass - try to fill uniform tiles
+    // This is done single-threaded for simplicity (tiles are fast to evaluate)
+    int tiles_filled = 0;
+    int tiles_total = 0;
+    for (int ty = 0; ty < state.height; ty += TILE_SIZE) {
+        for (int tx = 0; tx < state.width; tx += TILE_SIZE) {
+            tiles_total++;
+            if (try_fill_tile(state, orbit, tx, ty, TILE_SIZE, TILE_SIZE)) {
+                tiles_filled++;
+            }
+        }
+    }
+
+    // Phase 2: Per-pixel pass for remaining pixels
     std::vector<std::thread> threads;
     int rows_per_thread = state.height / num_threads;
 
@@ -1429,12 +1584,91 @@ void compute_perturbation_threaded(MandelbrotState& state, const ReferenceOrbit&
         int start = t * rows_per_thread;
         int end = (t == num_threads - 1) ? state.height : start + rows_per_thread;
 
-        threads.emplace_back([&state, &orbit, start, end]() {
-#if USE_AVX2
-            compute_perturbation_avx2(state, orbit, start, end);
-#else
-            compute_perturbation_scalar(state, orbit, start, end);
-#endif
+        threads.emplace_back([&state, &orbit, start, end, NEEDS_COMPUTE]() {
+            // Only compute pixels that weren't filled by block-level SA
+            double aspect = (double)state.width / (state.height * 2.0);
+            double scale = 3.0 / state.zoom;
+            double cos_a = cos(state.angle);
+            double sin_a = sin(state.angle);
+            double pan_x = state.pan_offset_x.hi + state.pan_offset_x.lo;
+            double pan_y = state.pan_offset_y.hi + state.pan_offset_y.lo;
+            int max_ref_iter = orbit.length - 1;
+
+            for (int y = start; y < end; y++) {
+                double dy = (y - state.height / 2.0) / state.height * scale;
+
+                for (int x = 0; x < state.width; x++) {
+                    int idx = y * state.width + x;
+
+                    // Skip if already computed by block-level SA
+                    if (state.iterations[idx] != NEEDS_COMPUTE) continue;
+
+                    double dx = (x - state.width / 2.0) / state.width * scale * aspect;
+                    double total_x = dx + pan_x;
+                    double total_y = dy + pan_y;
+                    double dCr = total_x * cos_a - total_y * sin_a;
+                    double dCi = total_x * sin_a + total_y * cos_a;
+
+                    double dzr = 0.0, dzi = 0.0;
+                    int iter = sa_find_skip_iteration(orbit, dCr, dCi, dzr, dzi, state.max_iter);
+
+                    bool escaped = false;
+                    bool glitched = false;
+                    double final_zr = 0, final_zi = 0;
+
+                    if (iter > 0) {
+                        double full_zr = orbit.Zr_sum[iter] + dzr;
+                        double full_zi = orbit.Zi_sum[iter] + dzi;
+                        double mag2 = full_zr * full_zr + full_zi * full_zi;
+                        if (mag2 > 4.0) {
+                            escaped = true;
+                            final_zr = full_zr;
+                            final_zi = full_zi;
+                        }
+                    }
+
+                    while (!escaped && !glitched && iter < state.max_iter && iter < max_ref_iter) {
+                        double Zr = orbit.Zr_sum[iter];
+                        double Zi = orbit.Zi_sum[iter];
+
+                        double temp_r = 2.0 * Zr + dzr;
+                        double temp_i = 2.0 * Zi + dzi;
+
+                        double new_dzr = temp_r * dzr - temp_i * dzi + dCr;
+                        double new_dzi = temp_r * dzi + temp_i * dzr + dCi;
+
+                        dzr = new_dzr;
+                        dzi = new_dzi;
+                        iter++;
+
+                        double full_zr = Zr + dzr;
+                        double full_zi = Zi + dzi;
+                        double mag2 = full_zr * full_zr + full_zi * full_zi;
+
+                        if (mag2 > 4.0) {
+                            escaped = true;
+                            final_zr = full_zr;
+                            final_zi = full_zi;
+                            break;
+                        }
+
+                        // Glitch detection
+                        double dz_mag2 = dzr * dzr + dzi * dzi;
+                        if (dz_mag2 > mag2 * 1e6) {
+                            glitched = true;
+                            break;
+                        }
+                    }
+
+                    if (glitched) {
+                        state.iterations[idx] = -2.0;
+                    } else if (escaped) {
+                        state.iterations[idx] = smooth_iter(final_zr, final_zi, iter, state.max_iter);
+                    } else {
+                        state.iterations[idx] = -1.0;
+                    }
+                }
+            }
         });
     }
 
