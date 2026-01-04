@@ -777,6 +777,13 @@ struct MandelbrotState {
     // Series Approximation control
     bool disable_sa = false;  // Disable SA for benchmarking
 
+    // Reference orbit cache - avoid recomputing when center hasn't changed
+    bool orbit_cache_valid = false;
+    DD cached_center_x{0.0};
+    DD cached_center_y{0.0};
+    int cached_max_iter = 0;
+    bool cached_sa_enabled = true;
+
     // Sync DD and double centers (for display/compatibility)
     // Note: center_x/y are doubles, so we sum hi+lo for best approximation
     void sync_centers_to_dd() {
@@ -1694,14 +1701,34 @@ void compute_mandelbrot_unified(MandelbrotState& state) {
         int min_iter_for_zoom = 256 + (int)(log10(std::max(1.0, state.zoom)) * 64);
         int effective_max_iter = std::max(state.max_iter, std::min(4096, min_iter_for_zoom));
 
-        // Compute reference orbit at center_dd (not effective_center)
-        // Pan offset is added to δC in perturbation loop - this allows panning without
-        // recomputing reference orbit, and works because both pixel_offset and pan_offset
-        // are tiny values at extreme zoom (same order of magnitude)
-        compute_reference_orbit(state.primary_orbit,
-                               state.center_x_dd, state.center_y_dd,
-                               effective_max_iter,
-                               !state.disable_sa);
+        // Check if we can reuse the cached reference orbit
+        // Cache is valid if center, max_iter, and SA settings match
+        bool cache_hit = state.orbit_cache_valid &&
+                         state.cached_center_x.hi == state.center_x_dd.hi &&
+                         state.cached_center_x.lo == state.center_x_dd.lo &&
+                         state.cached_center_y.hi == state.center_y_dd.hi &&
+                         state.cached_center_y.lo == state.center_y_dd.lo &&
+                         state.cached_max_iter >= effective_max_iter &&
+                         state.cached_sa_enabled == !state.disable_sa;
+
+        if (!cache_hit) {
+            // Compute reference orbit at center_dd (not effective_center)
+            // Pan offset is added to δC in perturbation loop - this allows panning without
+            // recomputing reference orbit, and works because both pixel_offset and pan_offset
+            // are tiny values at extreme zoom (same order of magnitude)
+            compute_reference_orbit(state.primary_orbit,
+                                   state.center_x_dd, state.center_y_dd,
+                                   effective_max_iter,
+                                   !state.disable_sa);
+
+            // Update cache metadata
+            state.orbit_cache_valid = true;
+            state.cached_center_x = state.center_x_dd;
+            state.cached_center_y = state.center_y_dd;
+            state.cached_max_iter = effective_max_iter;
+            state.cached_sa_enabled = !state.disable_sa;
+        }
+        // else: reuse state.primary_orbit from cache
 
         // Temporarily use scaled iterations for perturbation
         int saved_max_iter = state.max_iter;
