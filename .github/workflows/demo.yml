@@ -110,12 +110,28 @@ jobs:
           ls -la assets/
         fi
 
-    - name: Commit and push GIF
+    - name: Commit and push GIF (amend to avoid history bloat)
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
         git add assets/mandelbrot.gif
-        git diff --staged --quiet || git commit -m "Update demo GIF"
-        git push
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+
+        # Check if the most recent commit is a GIF update (to amend it)
+        LAST_MSG=$(git log -1 --pretty=%s)
+        if [[ "$LAST_MSG" == "Update demo GIF" || "$LAST_MSG" == "Add demo GIF" ]]; then
+          echo "Amending previous GIF commit to avoid history bloat"
+          git commit --amend --no-edit
+          git push --force-with-lease
+        else
+          echo "Creating new GIF commit"
+          git commit -m "Update demo GIF"
+          git push
+        fi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
